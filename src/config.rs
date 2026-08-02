@@ -32,6 +32,27 @@ pub struct MailCfg {
 fn default_mail_from() -> String {
     "noreply@ipremios.com".into()
 }
+
+/// Fallback for configs without a `mail` block (e.g. `-git` mode):
+/// HEFESTO_MAIL_TO="a@x.com,b@y.com" enables reports with defaults.
+pub fn mail_from_env() -> Option<MailCfg> {
+    let to: Vec<String> = std::env::var("HEFESTO_MAIL_TO")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if to.is_empty() {
+        return None;
+    }
+    Some(MailCfg {
+        to,
+        from: default_mail_from(),
+        smtp_host_env: default_smtp_host_env(),
+        smtp_user_env: default_smtp_user_env(),
+        smtp_pass_env: default_smtp_pass_env(),
+    })
+}
 fn default_smtp_host_env() -> String {
     "SMTP_HOST".into()
 }

@@ -1,14 +1,12 @@
 //! Interactive navigation: environment folder -> stack -> compose services
-//! -> action. Build/Deploy are milestone 3/4 stubs for now; Deploy is
-//! additionally gated by the hostname check.
+//! -> action. Left-arrow (or Esc) steps back to the previous menu; at the
+//! root it exits. Deploy is gated by the hostname check (milestone 4 will
+//! implement it).
 
 use crate::config::Config;
+use crate::ui::{self, Pick};
 use crate::vault::MemFs;
 use anyhow::Result;
-use inquire::Select;
-
-const BACK: &str = "⬅ back";
-const QUIT: &str = "✖ quit";
 
 pub struct Session<'a> {
     pub fs: &'a MemFs,
@@ -18,44 +16,40 @@ pub struct Session<'a> {
 }
 
 pub fn run(session: &Session) -> Result<()> {
+    let envs: Vec<String> = session
+        .fs
+        .subdirs("")
+        .into_iter()
+        .filter(|d| !session.cfg.exclude_folders.contains(d) && !d.starts_with('.'))
+        .collect();
+    if envs.is_empty() {
+        eprintln!("no environment folders found");
+        return Ok(());
+    }
     loop {
-        let mut envs: Vec<String> = session
-            .fs
-            .subdirs("")
-            .into_iter()
-            .filter(|d| !session.cfg.exclude_folders.contains(d) && !d.starts_with('.'))
-            .collect();
-        if envs.is_empty() {
-            eprintln!("no environment folders found");
-            return Ok(());
+        match ui::select("Environment folder", &envs)? {
+            Pick::Back => return Ok(()), // ← at root exits
+            Pick::Item(i) => pick_stack(session, &envs[i])?,
         }
-        envs.push(QUIT.into());
-        let env = Select::new("Environment folder:", envs).prompt()?;
-        if env == QUIT {
-            return Ok(());
-        }
-        pick_stack(session, &env)?;
     }
 }
 
 fn pick_stack(session: &Session, env: &str) -> Result<()> {
+    let stacks: Vec<String> = session
+        .fs
+        .subdirs(env)
+        .into_iter()
+        .filter(|d| !session.cfg.exclude_subfolders.contains(d))
+        .collect();
+    if stacks.is_empty() {
+        eprintln!("  ({env} has no stack subfolders)");
+        return Ok(());
+    }
     loop {
-        let mut stacks: Vec<String> = session
-            .fs
-            .subdirs(env)
-            .into_iter()
-            .filter(|d| !session.cfg.exclude_subfolders.contains(d))
-            .collect();
-        if stacks.is_empty() {
-            eprintln!("  ({env} has no stack subfolders)");
-            return Ok(());
+        match ui::select(&format!("Stack in {env}"), &stacks)? {
+            Pick::Back => return Ok(()),
+            Pick::Item(i) => pick_service(session, env, &stacks[i])?,
         }
-        stacks.push(BACK.into());
-        let stack = Select::new(&format!("Stack in {env}:"), stacks).prompt()?;
-        if stack == BACK {
-            return Ok(());
-        }
-        pick_service(session, env, &stack)?;
     }
 }
 
@@ -91,17 +85,15 @@ fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
         })
         .unwrap_or_default();
 
+    let mut options: Vec<String> = vec![format!("🏗  whole stack ({} services)", services.len())];
+    options.extend(services.iter().map(|(s, _)| s.clone()));
+
     loop {
-        let whole = format!("🏗  whole stack ({} services)", services.len());
-        let mut options = vec![whole.clone()];
-        options.extend(services.iter().map(|(s, _)| format!("   {s}")));
-        options.push(BACK.into());
-        let choice = Select::new(&format!("{env}/{stack} — target:"), options).prompt()?;
-        if choice == BACK {
-            return Ok(());
+        match ui::select(&format!("{env}/{stack} — target"), &options)? {
+            Pick::Back => return Ok(()),
+            Pick::Item(0) => pick_action(session, env, stack, None)?,
+            Pick::Item(i) => pick_action(session, env, stack, services.get(i - 1))?,
         }
-        let target = services.iter().find(|(s, _)| *s == choice.trim());
-        pick_action(session, env, stack, target)?;
     }
 }
 
@@ -120,19 +112,25 @@ fn pick_action(
             session.host
         )
     };
-    let actions = vec!["🔨 Build".to_string(), deploy_label, BACK.into()];
-    let choice = Select::new(&format!("Action for {env}/{stack} [{label}]:"), actions).prompt()?;
-    match choice.as_str() {
-        "🔨 Build" => run_builds(session, env, stack, service),
-        s if s.starts_with("🚀 Deploy") => {
-            if session.deploy_allowed {
-                eprintln!("  deploy for {env}/{stack} [{label}] — coming in milestone 4 (stdin compose deploy)");
-            } else {
-                eprintln!("  deploy refused: this binary only deploys on the repo's own host");
+    let actions = vec!["🔨 Build".to_string(), deploy_label];
+    loop {
+        match ui::select(&format!("Action for {env}/{stack} [{label}]"), &actions)? {
+            Pick::Back => return Ok(()),
+            Pick::Item(0) => {
+                run_builds(session, env, stack, service)?;
+                return Ok(()); // back to target menu after a build run
             }
-            Ok(())
+            Pick::Item(_) => {
+                if session.deploy_allowed {
+                    eprintln!(
+                        "  deploy for {env}/{stack} [{label}] — coming in milestone 4 (stdin compose deploy)"
+                    );
+                } else {
+                    eprintln!("  deploy refused: this binary only deploys on the repo's own host");
+                }
+                return Ok(());
+            }
         }
-        _ => Ok(()),
     }
 }
 
@@ -159,6 +157,7 @@ pub fn run_builds(
             }
         },
     };
+
     // legacy step 2: registry login — once per distinct destination that
     // will actually be pushed to (build-only runs need no credentials)
     let mut seen = std::collections::BTreeSet::new();
@@ -199,6 +198,11 @@ pub fn run_builds(
         if let Err(e) = crate::mail::send_report(mail_cfg, &subject, &body) {
             eprintln!("⚠️  could not mail the report: {e:#}");
         }
+    } else {
+        eprintln!(
+            "ℹ️  report not mailed — no mail configured (add a \"mail\" block to hefesto.json \
+             or set HEFESTO_MAIL_TO=addr1,addr2)"
+        );
     }
     Ok(())
 }

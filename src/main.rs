@@ -3,6 +3,7 @@ mod config;
 mod mail;
 mod nav;
 mod remote;
+mod ui;
 mod vault;
 
 use anyhow::Result;
@@ -37,7 +38,7 @@ fn run() -> Result<()> {
         args.remove(i);
     }
 
-    let cfg = match args.as_slice() {
+    let mut cfg = match args.as_slice() {
         [] => Config::load("hefesto.json")?,
         [flag, url] if flag == "-git" || flag == "--git" => Config::from_git_url(url)?,
         [flag] if flag == "-h" || flag == "--help" => {
@@ -47,6 +48,10 @@ fn run() -> Result<()> {
         [path] if !path.starts_with('-') => Config::load(path)?,
         _ => anyhow::bail!("invalid arguments\n{USAGE}"),
     };
+
+    if cfg.mail.is_none() {
+        cfg.mail = config::mail_from_env();
+    }
 
     let host = config::short_hostname();
     let expected = cfg.expected_hostname();
