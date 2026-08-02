@@ -22,8 +22,101 @@ use crate::vault::MemFs;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::time::Instant;
+
+/// Outcome of one build, for on-screen summary and mailed reports.
+pub struct BuildReport {
+    pub image: String,
+    pub source: String,
+    pub ok: bool,
+    pub duration_secs: u64,
+    /// captured docker output (kept to the last `LOG_KEEP_LINES` lines)
+    pub log: String,
+}
+
+const LOG_KEEP_LINES: usize = 400;
+
+/// Run a command streaming its output live to the terminal AND capturing
+/// it. `stdin_data` (the tar context) is fed from a thread to avoid
+/// pipe-buffer deadlocks with chatty children.
+fn run_tee(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("failed to run `docker` — is it installed?")?;
+
+    let stdin_handle = stdin_data.map(|data| {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data); // drop closes the pipe
+        })
+    });
+    let out = child.stdout.take().expect("piped stdout");
+    let err = child.stderr.take().expect("piped stderr");
+    let t_out = std::thread::spawn(move || {
+        let mut buf = String::new();
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            println!("{line}");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut buf = String::new();
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        buf
+    });
+    let status = child.wait()?;
+    if let Some(h) = stdin_handle {
+        let _ = h.join();
+    }
+    let mut log = t_out.join().unwrap_or_default();
+    log.push_str(&t_err.join().unwrap_or_default());
+    Ok((status.success(), tail_lines(&log, LOG_KEEP_LINES)))
+}
+
+/// Plain-text report for mails / logs.
+pub fn report_body(env: &str, stack: &str, reports: &[BuildReport]) -> String {
+    let mut b = String::new();
+    let ok = reports.iter().filter(|r| r.ok).count();
+    b.push_str(&format!(
+        "hefesto build report — {env}/{stack}\n{ok}/{} builds succeeded\n\n",
+        reports.len()
+    ));
+    for r in reports {
+        b.push_str(&format!(
+            "{} {}\n    source:   {}\n    duration: {}s\n",
+            if r.ok { "✅" } else { "❌" },
+            r.image,
+            r.source,
+            r.duration_secs
+        ));
+    }
+    for r in reports {
+        b.push_str(&format!("\n===== log: {} =====\n{}\n", r.image, r.log));
+    }
+    b
+}
+
+fn tail_lines(s: &str, keep: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= keep {
+        return s.to_string();
+    }
+    format!(
+        "... ({} earlier lines omitted)\n{}\n",
+        lines.len() - keep,
+        lines[lines.len() - keep..].join("\n")
+    )
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,15 +370,22 @@ pub fn find_for_service_image<'a>(bf: &'a BuildFile, service_image: &str) -> Opt
     bf.builds.iter().find(|b| b.image_name() == base)
 }
 
-/// Run one build, streaming docker output to the terminal.
-pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<()> {
+/// Run one build, streaming docker output to the terminal and returning
+/// a captured report.
+pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<BuildReport> {
+    let started = Instant::now();
     let (_, dest) = bf.destination_for(spec)?;
     let full_image = dest.image_ref(spec.image_name(), &spec.tag);
+    let source = format!("{}/{} @ {}", spec.project, spec.repository, spec.branch);
     eprintln!("\n🔥 forging {full_image}");
-    eprintln!(
-        "   source: {}/{} @ {}",
-        spec.project, spec.repository, spec.branch
-    );
+    eprintln!("   source: {source}");
+    let report = |ok: bool, log: String, started: Instant| BuildReport {
+        image: full_image.clone(),
+        source: source.clone(),
+        ok,
+        duration_secs: started.elapsed().as_secs(),
+        log,
+    };
 
     // 1. build context into RAM
     let ctx_fs = match &spec.local_path {
@@ -332,37 +432,35 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<()> {
         tar_bytes.len() / 1024
     );
 
-    // 3. docker build - (stdout/stderr inherited => live output)
+    // 3. docker build - (output streamed live AND captured for the report)
     let mut cmd = Command::new("docker");
     cmd.args(["build", "--pull", "-t", &full_image, "-f", &dockerfile]);
     for (k, v) in &spec.args {
         cmd.args(["--build-arg", &format!("{k}={v}")]);
     }
     cmd.arg("-");
-    cmd.stdin(Stdio::piped());
-    let mut child = cmd.spawn().context("failed to run `docker` — is it installed?")?;
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(&tar_bytes)
-        .context("streaming build context to docker")?;
-    let status = child.wait()?;
-    if !status.success() {
-        bail!("build FAILED for {full_image} (docker exit {status})");
+    let (ok, mut log) = run_tee(cmd, Some(tar_bytes))?;
+    if !ok {
+        eprintln!("❌ build FAILED for {full_image}");
+        return Ok(report(false, log, started));
     }
     eprintln!("✅ built {full_image}");
 
-    // 4. optional push, same live streaming
+    // 4. optional push, same tee'd streaming
     if spec.push {
         eprintln!("📤 pushing {full_image}");
-        let status = Command::new("docker").args(["push", &full_image]).status()?;
-        if !status.success() {
-            bail!("push FAILED for {full_image} (docker exit {status})");
+        let mut cmd = Command::new("docker");
+        cmd.args(["push", &full_image]);
+        let (push_ok, push_log) = run_tee(cmd, None)?;
+        log.push_str("\n--- push ---\n");
+        log.push_str(&push_log);
+        if !push_ok {
+            eprintln!("❌ push FAILED for {full_image}");
+            return Ok(report(false, log, started));
         }
         eprintln!("✅ pushed {full_image}");
     }
-    Ok(())
+    Ok(report(true, log, started))
 }
 
 fn to_tar(fs: &MemFs) -> Result<Vec<u8>> {

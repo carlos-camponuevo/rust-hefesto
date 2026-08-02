@@ -1,5 +1,6 @@
 mod build;
 mod config;
+mod mail;
 mod nav;
 mod remote;
 mod vault;

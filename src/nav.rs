@@ -159,26 +159,46 @@ pub fn run_builds(
             }
         },
     };
-    // legacy step 2: registry login — once per distinct destination used
+    // legacy step 2: registry login — once per distinct destination that
+    // will actually be pushed to (build-only runs need no credentials)
     let mut seen = std::collections::BTreeSet::new();
-    for spec in &targets {
+    for spec in targets.iter().filter(|s| s.push) {
         let (name, dest) = bf.destination_for(spec)?;
         if seen.insert(name.to_string()) {
             crate::build::registry_login(name, dest)?;
         }
     }
 
-    let mut failed = 0;
+    let mut reports: Vec<crate::build::BuildReport> = Vec::new();
     for spec in &targets {
-        if let Err(e) = crate::build::run_build(session.cfg, &bf, spec) {
-            eprintln!("❌ {e:#}");
-            failed += 1;
+        match crate::build::run_build(session.cfg, &bf, spec) {
+            Ok(r) => reports.push(r),
+            Err(e) => {
+                // build never started (download/config error) — still report it
+                eprintln!("❌ {e:#}");
+                reports.push(crate::build::BuildReport {
+                    image: spec.image_name().to_string(),
+                    source: format!("{}/{} @ {}", spec.project, spec.repository, spec.branch),
+                    ok: false,
+                    duration_secs: 0,
+                    log: format!("{e:#}"),
+                });
+            }
         }
     }
-    eprintln!(
-        "\n🏁 {}/{} builds succeeded in {env}/{stack}",
-        targets.len() - failed,
-        targets.len()
-    );
+    let ok = reports.iter().filter(|r| r.ok).count();
+    eprintln!("\n🏁 {ok}/{} builds succeeded in {env}/{stack}", reports.len());
+
+    if let Some(mail_cfg) = &session.cfg.mail {
+        let subject = format!(
+            "[hefesto] {env}/{stack}: {ok}/{} builds {}",
+            reports.len(),
+            if ok == reports.len() { "OK ✅" } else { "with FAILURES ❌" }
+        );
+        let body = crate::build::report_body(env, stack, &reports);
+        if let Err(e) = crate::mail::send_report(mail_cfg, &subject, &body) {
+            eprintln!("⚠️  could not mail the report: {e:#}");
+        }
+    }
     Ok(())
 }

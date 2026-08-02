@@ -9,6 +9,37 @@ pub struct Config {
     pub exclude_folders: Vec<String>,
     #[serde(default = "default_exclude_subfolders")]
     pub exclude_subfolders: Vec<String>,
+    /// Optional: mail build reports. SMTP credentials come from env vars.
+    #[serde(default)]
+    pub mail: Option<MailCfg>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailCfg {
+    pub to: Vec<String>,
+    #[serde(default = "default_mail_from")]
+    pub from: String,
+    /// Env var names (values never live in config files).
+    #[serde(default = "default_smtp_host_env")]
+    pub smtp_host_env: String,
+    #[serde(default = "default_smtp_user_env")]
+    pub smtp_user_env: String,
+    #[serde(default = "default_smtp_pass_env")]
+    pub smtp_pass_env: String,
+}
+
+fn default_mail_from() -> String {
+    "noreply@ipremios.com".into()
+}
+fn default_smtp_host_env() -> String {
+    "SMTP_HOST".into()
+}
+fn default_smtp_user_env() -> String {
+    "SMTP_USER".into()
+}
+fn default_smtp_pass_env() -> String {
+    "SMTP_PASS".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +102,7 @@ impl Config {
             },
             exclude_folders: default_exclude_folders(),
             exclude_subfolders: default_exclude_subfolders(),
+            mail: None,
         })
     }
 
