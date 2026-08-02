@@ -305,10 +305,20 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<()> {
             MemFs::from_zip(&remote::download_repo_zip(&repo)?)?
         }
     };
-    if ctx_fs.get(&spec.dockerfile).is_none() {
+    // Pick the dockerfile. The plain `Dockerfile` in these repos often
+    // expects artifacts compiled OUTSIDE docker (legacy flow ran gradle
+    // first); `DockerfileGitHub` is the self-contained multi-stage variant.
+    // Since hefesto builds from a pristine in-memory context, prefer the
+    // self-contained one unless build.yml pinned a dockerfile explicitly.
+    let mut dockerfile = spec.dockerfile.clone();
+    if dockerfile == default_dockerfile() && ctx_fs.get("DockerfileGitHub").is_some() {
+        dockerfile = "DockerfileGitHub".to_string();
+        eprintln!("   using DockerfileGitHub (self-contained build)");
+    }
+    if ctx_fs.get(&dockerfile).is_none() {
         bail!(
             "'{}' not found in {} (files: {})",
-            spec.dockerfile,
+            dockerfile,
             spec.repository,
             ctx_fs.files.len()
         );
@@ -324,7 +334,7 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<()> {
 
     // 3. docker build - (stdout/stderr inherited => live output)
     let mut cmd = Command::new("docker");
-    cmd.args(["build", "--pull", "-t", &full_image, "-f", &spec.dockerfile]);
+    cmd.args(["build", "--pull", "-t", &full_image, "-f", &dockerfile]);
     for (k, v) in &spec.args {
         cmd.args(["--build-arg", &format!("{k}={v}")]);
     }
