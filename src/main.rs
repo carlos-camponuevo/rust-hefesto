@@ -1,3 +1,4 @@
+mod build;
 mod config;
 mod nav;
 mod remote;
@@ -17,13 +18,24 @@ fn main() {
 }
 
 const USAGE: &str = "usage:
-  hefesto [config.json]        load config file (default: ./hefesto.json)
-  hefesto -git <url>           derive config from an Azure DevOps git URL
-                               (https://dev.azure.com/org/project/_git/repo
-                                or git@ssh.dev.azure.com:v3/org/project/repo)";
+  hefesto [config.json]                 load config file (default: ./hefesto.json)
+  hefesto -git <url>                    derive config from an Azure DevOps git URL
+                                        (https://dev.azure.com/org/project/_git/repo
+                                         or git@ssh.dev.azure.com:v3/org/project/repo)
+  ... --build <env>/<stack>[/<service>] non-interactive: build a stack (or one
+                                        service of it) and exit";
 
 fn run() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // extract optional `--build <target>`
+    let mut build_target: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--build") {
+        anyhow::ensure!(i + 1 < args.len(), "--build needs <env>/<stack>[/<service>]\n{USAGE}");
+        build_target = Some(args.remove(i + 1));
+        args.remove(i);
+    }
+
     let cfg = match args.as_slice() {
         [] => Config::load("hefesto.json")?,
         [flag, url] if flag == "-git" || flag == "--git" => Config::from_git_url(url)?,
@@ -84,12 +96,43 @@ fn run() -> Result<()> {
         eprintln!("   (no .enc files found — nothing to decrypt)");
     }
 
-    // 3. navigate
     let session = nav::Session {
         fs: &fs,
         cfg: &cfg,
         deploy_allowed,
         host,
     };
+
+    // 3a. non-interactive build
+    if let Some(target) = build_target {
+        let parts: Vec<&str> = target.split('/').collect();
+        let (env, stack, svc_name) = match parts.as_slice() {
+            [e, s] => (*e, *s, None),
+            [e, s, svc] => (*e, *s, Some(*svc)),
+            _ => anyhow::bail!("--build target must be <env>/<stack>[/<service>]"),
+        };
+        let service_pair = match svc_name {
+            None => None,
+            Some(name) => {
+                let compose = fs
+                    .get(&format!("{env}/{stack}/docker-compose.yml"))
+                    .ok_or_else(|| anyhow::anyhow!("no docker-compose.yml in {env}/{stack}"))?;
+                let doc: serde_yaml::Value = serde_yaml::from_slice(compose)?;
+                let image = doc
+                    .get("services")
+                    .and_then(|s| s.get(name))
+                    .and_then(|s| s.get("image"))
+                    .and_then(|i| i.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("service '{name}' not found in {env}/{stack} compose")
+                    })?
+                    .to_string();
+                Some((name.to_string(), image))
+            }
+        };
+        return nav::run_builds(&session, env, stack, service_pair.as_ref());
+    }
+
+    // 3b. interactive navigation
     nav::run(&session)
 }

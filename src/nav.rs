@@ -72,12 +72,21 @@ fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
             return Ok(());
         }
     };
-    let services: Vec<String> = doc
+    // service name -> image (needed to map a service onto a build entry)
+    let services: Vec<(String, String)> = doc
         .get("services")
         .and_then(|s| s.as_mapping())
         .map(|m| {
-            m.keys()
-                .filter_map(|k| k.as_str().map(String::from))
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let name = k.as_str()?.to_string();
+                    let image = v
+                        .get("image")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    Some((name, image))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -85,23 +94,24 @@ fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
     loop {
         let whole = format!("🏗  whole stack ({} services)", services.len());
         let mut options = vec![whole.clone()];
-        options.extend(services.iter().map(|s| format!("   {s}")));
+        options.extend(services.iter().map(|(s, _)| format!("   {s}")));
         options.push(BACK.into());
         let choice = Select::new(&format!("{env}/{stack} — target:"), options).prompt()?;
         if choice == BACK {
             return Ok(());
         }
-        let target = if choice == whole {
-            None
-        } else {
-            Some(choice.trim().to_string())
-        };
-        pick_action(session, env, stack, target.as_deref())?;
+        let target = services.iter().find(|(s, _)| *s == choice.trim());
+        pick_action(session, env, stack, target)?;
     }
 }
 
-fn pick_action(session: &Session, env: &str, stack: &str, service: Option<&str>) -> Result<()> {
-    let label = service.unwrap_or("whole stack");
+fn pick_action(
+    session: &Session,
+    env: &str,
+    stack: &str,
+    service: Option<&(String, String)>,
+) -> Result<()> {
+    let label = service.map(|(s, _)| s.as_str()).unwrap_or("whole stack");
     let deploy_label = if session.deploy_allowed {
         "🚀 Deploy".to_string()
     } else {
@@ -113,17 +123,62 @@ fn pick_action(session: &Session, env: &str, stack: &str, service: Option<&str>)
     let actions = vec!["🔨 Build".to_string(), deploy_label, BACK.into()];
     let choice = Select::new(&format!("Action for {env}/{stack} [{label}]:"), actions).prompt()?;
     match choice.as_str() {
-        "🔨 Build" => {
-            eprintln!("  build for {env}/{stack} [{label}] — coming in milestone 3 (build.yml + in-memory docker build)");
-        }
+        "🔨 Build" => run_builds(session, env, stack, service),
         s if s.starts_with("🚀 Deploy") => {
             if session.deploy_allowed {
                 eprintln!("  deploy for {env}/{stack} [{label}] — coming in milestone 4 (stdin compose deploy)");
             } else {
                 eprintln!("  deploy refused: this binary only deploys on the repo's own host");
             }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
+}
+
+pub fn run_builds(
+    session: &Session,
+    env: &str,
+    stack: &str,
+    service: Option<&(String, String)>,
+) -> Result<()> {
+    let Some(bf) = crate::build::load(session.fs, env, stack)? else {
+        eprintln!("  no build.yml and no parseable legacy build.sh in {env}/{stack} — nothing to build");
+        return Ok(());
+    };
+    let targets: Vec<&crate::build::BuildSpec> = match service {
+        None => bf.builds.iter().collect(),
+        Some((name, image)) => match crate::build::find_for_service_image(&bf, image) {
+            Some(spec) => vec![spec],
+            None => {
+                eprintln!(
+                    "  service '{name}' (image '{image}') has no matching build entry — \
+                     it uses a stock image or is built by another stack"
+                );
+                return Ok(());
+            }
+        },
+    };
+    // legacy step 2: registry login — once per distinct destination used
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in &targets {
+        let (name, dest) = bf.destination_for(spec)?;
+        if seen.insert(name.to_string()) {
+            crate::build::registry_login(name, dest)?;
+        }
+    }
+
+    let mut failed = 0;
+    for spec in &targets {
+        if let Err(e) = crate::build::run_build(session.cfg, &bf, spec) {
+            eprintln!("❌ {e:#}");
+            failed += 1;
+        }
+    }
+    eprintln!(
+        "\n🏁 {}/{} builds succeeded in {env}/{stack}",
+        targets.len() - failed,
+        targets.len()
+    );
     Ok(())
 }
