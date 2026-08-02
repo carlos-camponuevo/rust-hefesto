@@ -1,0 +1,30 @@
+[package]
+name = "hefesto"
+version = "0.1.0"
+edition = "2024"
+description = "Forge of the gods: in-memory build & deploy tool for encrypted docker stack repos"
+
+[dependencies]
+# config + parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+# repo download (blocking is fine for a CLI; rustls avoids system OpenSSL)
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+base64 = "0.22"
+# openssl-enc-compatible decryption, pure Rust
+aes = "0.8"
+cbc = { version = "0.1", features = ["block-padding", "alloc"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+zeroize = "1"
+# UX
+inquire = "0.7"
+anyhow = "1"
+hostname = "0.4"
+
+[profile.release]
+strip = true
+lto = true
+panic = "abort"

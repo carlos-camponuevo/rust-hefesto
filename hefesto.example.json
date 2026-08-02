@@ -1,0 +1,11 @@
+{
+  "repo": {
+    "organization": "BatDigitalI",
+    "project": "Data Bridge",
+    "repository": "devops-azcrpzanevla04",
+    "branch": "main",
+    "patEnv": "AZDO_PAT"
+  },
+  "excludeFolders": ["shared", "server", "xfiles"],
+  "excludeSubfolders": ["config", "conf"]
+}
