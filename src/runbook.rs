@@ -437,12 +437,14 @@ h3 { font-size:10.8pt; color:var(--accent); margin-top:13px; }
 p { margin:0 0 7px; } ul { margin:0 0 8px 16px; padding:0; } li { margin-bottom:3px; }
 .cover { height:245mm; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center; }
 .cover .t { font-size:34pt; font-weight:700; color:var(--navy); letter-spacing:-.5px; }
+.cover .rule { background:linear-gradient(90deg,#c8973e,#e0b45c); }
 .cover .s { font-size:15pt; color:var(--grey); margin-top:10px; letter-spacing:3px; text-transform:uppercase; }
 .cover .rule { width:70mm; height:3px; background:var(--navy); margin:22px 0; }
 .cover .stats { display:flex; gap:26px; margin-top:8px; }
 .cover .stat b { display:block; font-size:20pt; color:var(--accent); }
 .cover .stat span { font-size:8.5pt; color:var(--grey); text-transform:uppercase; letter-spacing:1px; }
-.cover .meta { margin-top:34mm; font-size:9pt; color:var(--grey); }
+.cover .logo { width:86mm; margin-bottom:12mm; border-radius:3mm; }
+.cover .meta { margin-top:30mm; font-size:9pt; color:var(--grey); }
 .page { page-break-before:always; }
 .lead { color:var(--grey); font-size:9pt; margin-bottom:10px; }
 .badge { display:inline-block; background:var(--soft); border:1px solid var(--line); border-radius:9px; padding:1px 8px; font-size:8.2pt; color:var(--accent); margin-right:5px; }
@@ -459,6 +461,18 @@ table { border-collapse:collapse; width:100%; margin:6px 0 12px; } tr { page-bre
 .toc .l2 { margin-left:14px; color:#374151; font-size:9pt; }
 code { font-family:"SF Mono",Menlo,monospace; font-size:8.4pt; background:var(--soft); padding:0 3px; border-radius:3px; }
 "#;
+
+/// Logo embedded at compile time so a generated runbook is self-contained
+/// (the HTML has no external references and the PDF renders offline).
+const LOGO_PNG: &[u8] = include_bytes!("../docs/brand/hefesto.logo-small.png");
+
+fn logo_data_uri() -> String {
+    use base64::Engine;
+    format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(LOGO_PNG)
+    )
+}
 
 fn html_prose(text: &str) -> String {
     if text.trim().is_empty() {
@@ -524,13 +538,15 @@ pub fn render_html(stacks: &[Stack], repo: &str, today: &str, intro: &str) -> St
     ));
     // cover
     h.push_str(&format!(
-        "<div class=\"cover\"><div class=\"t\">DevOps Platform Runbook</div><div class=\"rule\"></div>\
+        "<div class=\"cover\"><img class=\"logo\" src=\"{}\" alt=\"hefesto\">\
+         <div class=\"t\">DevOps Platform Runbook</div><div class=\"rule\"></div>\
          <div class=\"s\">{}</div><div class=\"stats\">\
          <div class=\"stat\"><b>{}</b><span>Stacks</span></div>\
          <div class=\"stat\"><b>{}</b><span>Services</span></div>\
          <div class=\"stat\"><b>{}</b><span>Built from source</span></div>\
          <div class=\"stat\"><b>{}</b><span>Images</span></div></div>\
          <div class=\"meta\">{} &nbsp;·&nbsp; generated automatically by hefesto on {today}</div></div>",
+        logo_data_uri(),
         esc(&envs.join(" · ")), stacks.len(), svc.len(), with_build, images.len(), esc(repo)
     ));
     // contents

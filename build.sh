@@ -10,7 +10,10 @@ if [ -d .git ]; then
 fi
 
 echo "🔨 building (docker, native arch)"
-DOCKER_BUILDKIT=1 docker build --target artifact -o dist .
+if ! DOCKER_BUILDKIT=1 docker build --target artifact -o dist .; then
+  echo "❌ build failed — the installed binary was NOT replaced" >&2
+  exit 1
+fi
 
 arch="$(uname -m)"
 install -m 755 dist/hefesto "/usr/local/bin/hefesto"

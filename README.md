@@ -1,7 +1,14 @@
-# 🔥 hefesto
+<p align="center">
+  <img src="docs/brand/hefesto.logo.png" alt="hefesto — forge of the gods" width="620">
+</p>
 
-Forge of the gods — an in-memory build, deploy and documentation tool for
-encrypted `devops-*` Docker Swarm repositories.
+<p align="center">
+  <b>In-memory build, deploy and documentation for encrypted <code>devops-*</code> Docker Swarm repositories.</b><br>
+  <a href="https://github.com/carlos-camponuevo/rust-hefesto/releases/latest">Download</a> ·
+  <a href="#usage">Usage</a> ·
+  <a href="#build-definitions">Build definitions</a> ·
+  <a href="#runbook">Runbook</a>
+</p>
 
 Everything happens in process memory: the deployment repository is
 downloaded as a zip into RAM, its encrypted files are decrypted in RAM
@@ -12,6 +19,14 @@ written to disk.**
 
 A single static binary, no runtime dependencies: `cargo build --release`
 produces one file you can copy to any machine of the same architecture.
+
+<p align="center">
+  <img src="docs/brand/hefesto.banner.png" alt="How hefesto works: download to RAM, decrypt in memory, build from memory, deploy via stdin" width="760">
+</p>
+
+<p align="center">
+  <img src="docs/brand/hefesto.features.png" alt="build · deploy · docs · secure · encrypted · in-memory" width="820">
+</p>
 
 ## Usage
 

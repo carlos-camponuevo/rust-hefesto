@@ -6,6 +6,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tests ./tests
+# brand assets: src/runbook.rs embeds the logo with include_bytes!
+COPY docs/brand ./docs/brand
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo test --release && \
