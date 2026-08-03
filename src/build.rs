@@ -155,9 +155,15 @@ pub struct Destination {
     /// "docker.io" (default) or "ghcr.io".
     #[serde(default = "default_registry_host")]
     pub host: String,
-    /// Registry namespace (Docker Hub user / GHCR owner).
+    /// Registry namespace — the path segment in the image reference.
+    /// ALWAYS lowercase: Docker/GHCR require lowercase repository names.
     #[serde(default = "default_namespace")]
     pub namespace: String,
+    /// Login user for `docker login`. CASE-SENSITIVE and often different
+    /// from the namespace (e.g. namespace `my-org`, user `My-Org`).
+    /// Not a secret, so it can live in the config; the token never does.
+    #[serde(default)]
+    pub user: Option<String>,
     /// Env vars holding the docker login credentials (user + PAT).
     /// Defaults depend on the host: DOCKER_USER/DOCKER_PAT for docker.io,
     /// GHCR_USER/GHCR_PAT for ghcr.io.
@@ -252,6 +258,7 @@ fn default_destinations() -> BTreeMap<String, Destination> {
         Destination {
             host: default_registry_host(),
             namespace: default_namespace(),
+            user: None,
             user_env: None,
             pat_env: None,
         },
@@ -366,11 +373,23 @@ impl BuildSpec {
 /// from env vars (user + PAT) — never stored in files.
 pub fn registry_login(name: &str, dest: &Destination) -> Result<()> {
     let (user_env, pat_env) = (dest.user_env(), dest.pat_env());
-    let user = std::env::var(&user_env).unwrap_or_default();
+    // config `user:` wins; otherwise fall back to the env var
+    let user = dest
+        .user
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| std::env::var(&user_env).unwrap_or_default());
     let pat = std::env::var(&pat_env).unwrap_or_default();
-    if user.is_empty() || pat.is_empty() {
+    if user.is_empty() {
         bail!(
-            "destination '{name}' ({}) needs registry credentials:\n  export {user_env}='<user>'\n  export {pat_env}='<personal access token>'",
+            "destination '{name}' ({}) has no login user: add `user:` to the destination \
+             or export {user_env}",
+            dest.host
+        );
+    }
+    if pat.is_empty() {
+        bail!(
+            "destination '{name}' ({}) needs a token:\n  export {pat_env}='<personal access token>'",
             dest.host
         );
     }
@@ -429,6 +448,7 @@ pub fn load(fs: &MemFs, dir: &str) -> Result<Option<BuildFile>> {
                     Destination {
                         host,
                         namespace: default_namespace(),
+                        user: None,
                         user_env: None,
                         pat_env: None,
                     },
@@ -495,8 +515,8 @@ pub fn parse_legacy_repo_list(script: &str) -> Vec<BuildSpec> {
     out
 }
 
-/// Basename of a compose `image:` ref — "camponuevo/mn-bat-admin-api:za.uat.latest"
-/// => "mn-bat-admin-api". This is the key that groups services onto one build.
+/// Basename of a compose `image:` ref — "my-user/admin-api:uat.latest"
+/// => "admin-api". This is the key that groups services onto one build.
 pub fn image_base(image_ref: &str) -> Option<String> {
     Some(image_ref.rsplit('/').next()?.split(':').next()?.to_string())
 }
@@ -620,9 +640,9 @@ mod tests {
 
     const LEGACY: &str = r#"#!/usr/bin/env bash
 repoList=(
-   "BatDigitalI,ConectaRep,grails4-bat-admin-portal,grails-bat-admin-portal,release/uat20250503,za.uat.latest"
-#  "BatDigitalI,ConectaRep,disabled-repo,disabled-image,master,za.uat.latest"
-   "BatDigitalI,Core,mn-bat-admin-api,,master,za.uat.latest"
+   "ExampleOrg,AppProject,admin-portal-src,admin-portal,release/uat,uat.latest"
+#  "ExampleOrg,AppProject,disabled-repo,disabled-image,master,uat.latest"
+   "ExampleOrg,Core,admin-api,,master,uat.latest"
 )
 source "../../shared/build_dockerhub_creds.sh"
 source "../../shared/build_azuregit_stack.sh"
@@ -645,9 +665,9 @@ buildStackAzure "zauat" "repoList[@]"
         let builds = parse_legacy_repo_list(LEGACY);
         assert_eq!(builds.len(), 2, "commented-out entries must be skipped");
         assert!(builds.iter().all(|b| b.image_name() != "disabled-image"));
-        assert_eq!(builds[0].image_name(), "grails-bat-admin-portal");
-        assert_eq!(builds[0].branch, "release/uat20250503");
-        assert_eq!(builds[1].image_name(), "mn-bat-admin-api");
+        assert_eq!(builds[0].image_name(), "admin-portal");
+        assert_eq!(builds[0].branch, "release/uat");
+        assert_eq!(builds[1].image_name(), "admin-api");
         assert_eq!(builds[1].project, "Core");
     }
 
@@ -655,23 +675,27 @@ buildStackAzure "zauat" "repoList[@]"
     fn image_refs_per_destination() {
         let hub = Destination {
             host: "docker.io".into(),
-            namespace: "camponuevo".into(),
+            namespace: "my-user".into(),
+            user: None,
             user_env: None,
             pat_env: None,
         };
         let ghcr = Destination {
             host: "ghcr.io".into(),
-            namespace: "carlos-camponuevo".into(),
+            namespace: "my-org".into(),
+            user: Some("Carlos-Camponuevo".into()),
             user_env: None,
             pat_env: None,
         };
+        assert_eq!(ghcr.user.as_deref(), Some("Carlos-Camponuevo"));
+        assert_eq!(ghcr.namespace, "my-org");
         assert_eq!(
-            hub.image_ref("mn-bat-admin-api", "za.uat.latest"),
-            "camponuevo/mn-bat-admin-api:za.uat.latest"
+            hub.image_ref("admin-api", "uat.latest"),
+            "my-user/admin-api:uat.latest"
         );
         assert_eq!(
-            ghcr.image_ref("mn-bat-admin-api", "za.uat.latest"),
-            "ghcr.io/carlos-camponuevo/mn-bat-admin-api:za.uat.latest"
+            ghcr.image_ref("admin-api", "uat.latest"),
+            "ghcr.io/my-org/admin-api:uat.latest"
         );
         assert_eq!(hub.user_env(), "DOCKER_USER");
         assert_eq!(ghcr.pat_env(), "GHCR_PAT");
@@ -680,8 +704,8 @@ buildStackAzure "zauat" "repoList[@]"
     #[test]
     fn matches_service_image() {
         let bf = legacy_buildfile();
-        let hit = find_for_service_image(&bf, "camponuevo/mn-bat-admin-api:za.uat.latest").unwrap();
-        assert_eq!(hit.repository, "mn-bat-admin-api");
+        let hit = find_for_service_image(&bf, "my-user/admin-api:uat.latest").unwrap();
+        assert_eq!(hit.repository, "admin-api");
         assert!(find_for_service_image(&bf, "redis:7").is_none());
     }
 

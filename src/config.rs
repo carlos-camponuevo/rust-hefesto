@@ -85,13 +85,13 @@ pub struct Repo {
     /// "azdo" (default) or "github" — set automatically when `url` is given.
     #[serde(default = "default_provider")]
     pub provider: String,
-    /// Azure DevOps organization, e.g. "BatDigitalI"
+    /// Azure DevOps organization, e.g. "ExampleOrg"
     #[serde(default)]
     pub organization: String,
-    /// Azure DevOps project, e.g. "Data Bridge"
+    /// Azure DevOps project, e.g. "Example Project"
     #[serde(default)]
     pub project: String,
-    /// Repository name, e.g. "devops-azcrpzanevla04"
+    /// Repository name, e.g. "devops-server01"
     #[serde(default)]
     pub repository: String,
     #[serde(default = "default_branch")]
@@ -289,7 +289,7 @@ fn parse_azdo_url(url: &str) -> Option<(String, String, String)> {
     None
 }
 
-/// Decode %XX escapes (Azure DevOps URLs carry "Data%20Bridge").
+/// Decode %XX escapes (Azure DevOps URLs carry "Example%20Project").
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -318,37 +318,37 @@ mod tests {
     #[test]
     fn parses_https_url() {
         let (o, p, r) =
-            parse_azdo_url("https://dev.azure.com/BatDigitalI/Data%20Bridge/_git/devops-azcrpzanevla04")
+            parse_azdo_url("https://dev.azure.com/ExampleOrg/Example%20Project/_git/devops-server01")
                 .unwrap();
         assert_eq!((o.as_str(), p.as_str(), r.as_str()),
-                   ("BatDigitalI", "Data Bridge", "devops-azcrpzanevla04"));
+                   ("ExampleOrg", "Example Project", "devops-server01"));
     }
 
     #[test]
     fn parses_https_url_with_user() {
         let (o, p, r) =
-            parse_azdo_url("https://BatDigitalI@dev.azure.com/BatDigitalI/Data%20Bridge/_git/repo1/")
+            parse_azdo_url("https://ExampleOrg@dev.azure.com/ExampleOrg/Example%20Project/_git/repo1/")
                 .unwrap();
-        assert_eq!((o.as_str(), p.as_str(), r.as_str()), ("BatDigitalI", "Data Bridge", "repo1"));
+        assert_eq!((o.as_str(), p.as_str(), r.as_str()), ("ExampleOrg", "Example Project", "repo1"));
     }
 
     #[test]
     fn parses_ssh_url() {
         let (o, p, r) =
-            parse_azdo_url("git@ssh.dev.azure.com:v3/BatDigitalI/Data%20Bridge/devops-x").unwrap();
-        assert_eq!((o.as_str(), p.as_str(), r.as_str()), ("BatDigitalI", "Data Bridge", "devops-x"));
+            parse_azdo_url("git@ssh.dev.azure.com:v3/ExampleOrg/Example%20Project/devops-x").unwrap();
+        assert_eq!((o.as_str(), p.as_str(), r.as_str()), ("ExampleOrg", "Example Project", "devops-x"));
     }
 
     #[test]
     fn parses_github_urls() {
         let (prov, o, p, r) =
-            parse_git_url("https://github.com/carlos-camponuevo/devops-azcrpronevla03.git").unwrap();
+            parse_git_url("https://github.com/my-org/devops-azcrpronevla03.git").unwrap();
         assert_eq!((prov.as_str(), o.as_str(), p.as_str(), r.as_str()),
-                   ("github", "carlos-camponuevo", "", "devops-azcrpronevla03"));
-        let (prov, o, _, r) = parse_git_url("git@github.com:carlos-camponuevo/rust-hefesto.git").unwrap();
-        assert_eq!((prov.as_str(), o.as_str(), r.as_str()), ("github", "carlos-camponuevo", "rust-hefesto"));
+                   ("github", "my-org", "", "devops-azcrpronevla03"));
+        let (prov, o, _, r) = parse_git_url("git@github.com:my-org/rust-hefesto.git").unwrap();
+        assert_eq!((prov.as_str(), o.as_str(), r.as_str()), ("github", "my-org", "rust-hefesto"));
         // azdo still works through the same entry point
-        let (prov, ..) = parse_git_url("https://BatDigitalI@dev.azure.com/BatDigitalI/BatDevops/_git/devops-azcrnbrnevta19").unwrap();
+        let (prov, ..) = parse_git_url("https://ExampleOrg@dev.azure.com/ExampleOrg/BatDevops/_git/devops-azcrnbrnevta19").unwrap();
         assert_eq!(prov, "azdo");
     }
 

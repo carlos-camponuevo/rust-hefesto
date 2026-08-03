@@ -1,11 +1,13 @@
 {
   "repo": {
-    "organization": "BatDigitalI",
-    "project": "Data Bridge",
-    "repository": "devops-azcrpzanevla04",
+    "url": "https://dev.azure.com/<organization>/<project>/_git/devops-<hostname>",
     "branch": "main",
     "patEnv": "AZDO_PAT"
   },
   "excludeFolders": ["shared", "server", "xfiles"],
-  "excludeSubfolders": ["config", "conf"]
+  "excludeSubfolders": ["config", "conf"],
+  "mail": {
+    "to": ["ops@company.com"],
+    "from": "noreply@company.com"
+  }
 }
