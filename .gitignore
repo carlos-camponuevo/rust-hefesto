@@ -1,1 +1,6 @@
 /target
+/dist
+hefesto*.json
+hefesto*.yml
+hefesto*.yaml
+!hefesto.example.json

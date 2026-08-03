@@ -97,10 +97,13 @@ impl MemFs {
             .collect();
         let mut count = 0;
         for path in &enc_paths {
-            let data = self.files.remove(path).unwrap();
-            let plain = decrypt_openssl(&data, passphrase.as_bytes())
+            // decrypt BEFORE removing, so a wrong key leaves the vault
+            // intact for the retry
+            let data = self.files.get(path).unwrap();
+            let plain = decrypt_openssl(data, passphrase.as_bytes())
                 .with_context(|| format!("decrypting '{path}' (wrong key?)"))?;
             let target = path.trim_end_matches(".enc").to_string();
+            self.files.remove(path);
             self.files.insert(target, plain);
             self.files.remove(&format!("{path}.mode"));
             count += 1;
@@ -136,6 +139,11 @@ impl MemFs {
         out.dedup();
         out
     }
+}
+
+/// True when the bytes carry the OpenSSL `Salted__` encryption header.
+pub fn looks_encrypted(data: &[u8]) -> bool {
+    data.len() > 16 && &data[..8] == OPENSSL_MAGIC
 }
 
 /// OpenSSL `enc -aes-256-cbc -pbkdf2 -salt` compatible decryption.

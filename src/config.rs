@@ -53,6 +53,18 @@ pub fn mail_from_env() -> Option<MailCfg> {
         smtp_pass_env: default_smtp_pass_env(),
     })
 }
+/// MailCfg with default sender/SMTP env names for an ad-hoc recipient list
+/// (used by build.yml mailGroups routing).
+pub fn mailcfg_for(to: Vec<String>) -> MailCfg {
+    MailCfg {
+        to,
+        from: default_mail_from(),
+        smtp_host_env: default_smtp_host_env(),
+        smtp_user_env: default_smtp_user_env(),
+        smtp_pass_env: default_smtp_pass_env(),
+    }
+}
+
 fn default_smtp_host_env() -> String {
     "SMTP_HOST".into()
 }
@@ -66,11 +78,21 @@ fn default_smtp_pass_env() -> String {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Repo {
+    /// Alternative to organization/project/repository: the repo URL as
+    /// you'd pass to `-git`. When present it fills the three fields.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// "azdo" (default) or "github" — set automatically when `url` is given.
+    #[serde(default = "default_provider")]
+    pub provider: String,
     /// Azure DevOps organization, e.g. "BatDigitalI"
+    #[serde(default)]
     pub organization: String,
     /// Azure DevOps project, e.g. "Data Bridge"
+    #[serde(default)]
     pub project: String,
     /// Repository name, e.g. "devops-azcrpzanevla04"
+    #[serde(default)]
     pub repository: String,
     #[serde(default = "default_branch")]
     pub branch: String,
@@ -85,6 +107,9 @@ pub struct Repo {
 fn default_branch() -> String {
     "main".into()
 }
+fn default_provider() -> String {
+    "azdo".into()
+}
 fn default_pat_env() -> String {
     "AZDO_PAT".into()
 }
@@ -96,24 +121,87 @@ fn default_exclude_subfolders() -> Vec<String> {
 }
 
 impl Config {
-    pub fn load(path: &str) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("cannot read config file '{path}'"))?;
-        let cfg: Config =
-            serde_json::from_str(&raw).with_context(|| format!("invalid JSON in '{path}'"))?;
-        Ok(cfg)
+    /// Load a config file, transparently handling ed.sh-style encryption
+    /// (OpenSSL `Salted__` header). Returns the config and, when the file
+    /// was encrypted, the key that opened it — callers reuse it for the
+    /// repo decryption so the user is prompted only once.
+    pub fn load(path: &str) -> Result<(Self, Option<zeroize::Zeroizing<String>>)> {
+        // allow `hefesto.json` to silently mean `hefesto.json.enc`
+        let actual = if !std::path::Path::new(path).exists()
+            && std::path::Path::new(&format!("{path}.enc")).exists()
+        {
+            format!("{path}.enc")
+        } else {
+            path.to_string()
+        };
+        let raw = std::fs::read(&actual)
+            .with_context(|| format!("cannot read config file '{actual}'"))?;
+
+        let (json, key) = if crate::vault::looks_encrypted(&raw) {
+            eprintln!("🔐 config '{actual}' is encrypted");
+            let key = zeroize::Zeroizing::new(
+                inquire::Password::new("Config decrypt key:")
+                    .without_confirmation()
+                    .prompt()?,
+            );
+            let plain = crate::vault::decrypt_openssl(&raw, key.as_bytes())
+                .context("could not decrypt the config (wrong key?)")?;
+            (plain, Some(key))
+        } else {
+            (raw, None)
+        };
+
+        // YAML parser accepts JSON too (JSON ⊂ YAML) — one parser, both formats
+        let mut cfg: Config = serde_yaml::from_slice(&json)
+            .with_context(|| format!("invalid YAML/JSON in '{actual}'"))?;
+        cfg.resolve_repo_url()?;
+        Ok((cfg, key))
     }
 
-    /// Build a config straight from an Azure DevOps git URL, defaults for
-    /// the rest. Accepted forms:
-    ///   https://dev.azure.com/{org}/{project}/_git/{repo}
-    ///   https://{user}@dev.azure.com/{org}/{project}/_git/{repo}
-    ///   git@ssh.dev.azure.com:v3/{org}/{project}/{repo}
+    /// First existing default config: hefesto.{yml,yaml,json}[.enc].
+    pub fn default_path() -> String {
+        for p in ["hefesto.yml", "hefesto.yaml", "hefesto.json"] {
+            if std::path::Path::new(p).exists()
+                || std::path::Path::new(&format!("{p}.enc")).exists()
+            {
+                return p.to_string();
+            }
+        }
+        "hefesto.json".to_string()
+    }
+
+    /// If repo.url is set, derive provider + organization/project/repository.
+    fn resolve_repo_url(&mut self) -> Result<()> {
+        if let Some(url) = &self.repo.url {
+            let (provider, o, p, r) = parse_git_url(url)
+                .with_context(|| format!("repo.url is not a recognized git URL: '{url}'"))?;
+            self.repo.provider = provider;
+            self.repo.organization = o;
+            self.repo.project = p;
+            self.repo.repository = r;
+        }
+        anyhow::ensure!(
+            !self.repo.repository.is_empty() && !self.repo.organization.is_empty(),
+            "config needs either repo.url or repo.organization/repository"
+        );
+        anyhow::ensure!(
+            self.repo.provider != "azdo" || !self.repo.project.is_empty(),
+            "Azure DevOps repos also need repo.project"
+        );
+        Ok(())
+    }
+
+    /// Build a config straight from a git URL, defaults for the rest.
+    /// Accepted forms:
+    ///   https://dev.azure.com/{org}/{project}/_git/{repo}   (+ user@ / ssh v3)
+    ///   https://github.com/{owner}/{repo}[.git]             (+ git@github.com:)
     pub fn from_git_url(url: &str) -> Result<Self> {
-        let (organization, project, repository) = parse_azdo_url(url)
-            .with_context(|| format!("unrecognized Azure DevOps git URL: '{url}'"))?;
+        let (provider, organization, project, repository) =
+            parse_git_url(url).with_context(|| format!("unrecognized git URL: '{url}'"))?;
         Ok(Config {
             repo: Repo {
+                url: None,
+                provider,
                 organization,
                 project,
                 repository,
@@ -135,6 +223,41 @@ impl Config {
             .strip_prefix("devops-")
             .map(|h| h.to_ascii_lowercase())
     }
+}
+
+/// Parse any supported git URL -> (provider, organization, project, repo).
+/// GitHub has no "project" level — it comes back empty.
+pub fn parse_git_url(url: &str) -> Option<(String, String, String, String)> {
+    let u = url.trim().trim_end_matches('/');
+    // GitHub SSH: git@github.com:owner/repo(.git)
+    if let Some(rest) = u.strip_prefix("git@github.com:") {
+        let (owner, repo) = rest.split_once('/')?;
+        return Some((
+            "github".into(),
+            owner.to_string(),
+            String::new(),
+            repo.trim_end_matches(".git").to_string(),
+        ));
+    }
+    // GitHub HTTPS: https://github.com/owner/repo(.git)
+    let no_scheme = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"));
+    if let Some(rest) = no_scheme {
+        let rest = rest.split_once('@').map(|(_, r)| r).unwrap_or(rest);
+        if let Some(path) = rest.strip_prefix("github.com/") {
+            let parts: Vec<&str> = path.split('/').collect();
+            if let [owner, repo] = parts[..] {
+                return Some((
+                    "github".into(),
+                    owner.to_string(),
+                    String::new(),
+                    repo.trim_end_matches(".git").to_string(),
+                ));
+            }
+            return None;
+        }
+    }
+    // Azure DevOps
+    parse_azdo_url(url).map(|(o, p, r)| ("azdo".into(), o, p, r))
 }
 
 fn parse_azdo_url(url: &str) -> Option<(String, String, String)> {
@@ -214,6 +337,19 @@ mod tests {
         let (o, p, r) =
             parse_azdo_url("git@ssh.dev.azure.com:v3/BatDigitalI/Data%20Bridge/devops-x").unwrap();
         assert_eq!((o.as_str(), p.as_str(), r.as_str()), ("BatDigitalI", "Data Bridge", "devops-x"));
+    }
+
+    #[test]
+    fn parses_github_urls() {
+        let (prov, o, p, r) =
+            parse_git_url("https://github.com/carlos-camponuevo/devops-azcrpronevla03.git").unwrap();
+        assert_eq!((prov.as_str(), o.as_str(), p.as_str(), r.as_str()),
+                   ("github", "carlos-camponuevo", "", "devops-azcrpronevla03"));
+        let (prov, o, _, r) = parse_git_url("git@github.com:carlos-camponuevo/rust-hefesto.git").unwrap();
+        assert_eq!((prov.as_str(), o.as_str(), r.as_str()), ("github", "carlos-camponuevo", "rust-hefesto"));
+        // azdo still works through the same entry point
+        let (prov, ..) = parse_git_url("https://BatDigitalI@dev.azure.com/BatDigitalI/BatDevops/_git/devops-azcrnbrnevta19").unwrap();
+        assert_eq!(prov, "azdo");
     }
 
     #[test]

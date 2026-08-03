@@ -41,7 +41,7 @@ const LOG_KEEP_LINES: usize = 400;
 /// Run a command streaming its output live to the terminal AND capturing
 /// it. `stdin_data` (the tar context) is fed from a thread to avoid
 /// pipe-buffer deadlocks with chatty children.
-fn run_tee(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
+pub fn run_tee_cmd(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
@@ -84,11 +84,11 @@ fn run_tee(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, Strin
 }
 
 /// Plain-text report for mails / logs.
-pub fn report_body(env: &str, stack: &str, reports: &[BuildReport]) -> String {
+pub fn report_body_refs(dir: &str, reports: &[&BuildReport]) -> String {
     let mut b = String::new();
     let ok = reports.iter().filter(|r| r.ok).count();
     b.push_str(&format!(
-        "hefesto build report — {env}/{stack}\n{ok}/{} builds succeeded\n\n",
+        "hefesto build report — {dir}\n{ok}/{} builds succeeded\n\n",
         reports.len()
     ));
     for r in reports {
@@ -125,7 +125,28 @@ pub struct BuildFile {
     /// `destination:` (defaults to the single/first entry).
     #[serde(default = "default_destinations")]
     pub destinations: BTreeMap<String, Destination>,
+    /// Target platform for every build (overridable per entry). The swarm
+    /// nodes are x86_64, so this defaults to linux/amd64 — building on an
+    /// ARM host then requires QEMU binfmt, but NEVER silently produces an
+    /// image the servers cannot run.
+    #[serde(default = "default_platform")]
+    pub default_platform: String,
+    /// Named recipient groups for build reports. Entries opt in via
+    /// `mailGroup:`; entries without one send NO mail.
+    #[serde(default)]
+    pub mail_groups: BTreeMap<String, Vec<String>>,
+    /// v2 schema (preferred name).
+    #[serde(default)]
+    pub repo_list: Vec<BuildSpec>,
+    /// v1 schema (still accepted).
+    #[serde(default)]
     pub builds: Vec<BuildSpec>,
+    /// True when this list came from the ENVIRONMENT folder rather than the
+    /// stack folder — i.e. one shared catalog for all stacks of the env.
+    /// "Build whole stack" then builds only the catalog entries whose image
+    /// the stack's compose actually uses.
+    #[serde(skip)]
+    pub catalog: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -169,10 +190,32 @@ impl Destination {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildSpec {
+    /// Friendly application name, used in menus and reports.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Source repo URL (Azure DevOps or GitHub) — replaces the
+    /// organization/project/repository triple when present.
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    /// FUTURE: when set, the repo will be fetched via full `git clone`
+    /// instead of a zip snapshot. Accepted in the schema today, not
+    /// implemented yet.
+    #[serde(default)]
+    pub repo_clone_url: Option<String>,
+    /// Which mailGroups entry receives this build's report. None = no mail.
+    #[serde(default)]
+    pub mail_group: Option<String>,
+    /// `false` documents the image's provenance (it appears in the runbook)
+    /// while keeping it OUT of builds — the YAML equivalent of a
+    /// commented-out repoList line in the legacy build.sh.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     /// Azure DevOps organization; defaults to the devops repo's own org.
     #[serde(default)]
     pub organization: Option<String>,
+    #[serde(default)]
     pub project: String,
+    #[serde(default)]
     pub repository: String,
     /// Image name; defaults to the repository name.
     #[serde(default)]
@@ -189,6 +232,9 @@ pub struct BuildSpec {
     pub args: BTreeMap<String, String>,
     #[serde(default = "default_push")]
     pub push: bool,
+    /// Per-entry platform override (e.g. "linux/arm64").
+    #[serde(default)]
+    pub platform: Option<String>,
     /// Local directory as build context instead of a repo download (tests).
     #[serde(default)]
     pub local_path: Option<String>,
@@ -220,8 +266,23 @@ fn default_dockerfile() -> String {
 fn default_push() -> bool {
     true
 }
+fn default_enabled() -> bool {
+    true
+}
+fn default_platform() -> String {
+    "linux/amd64".into()
+}
 
 impl BuildFile {
+    /// The active build list: v2 `repoList` wins, else v1 `builds`.
+    pub fn entries(&self) -> &[BuildSpec] {
+        if !self.repo_list.is_empty() {
+            &self.repo_list
+        } else {
+            &self.builds
+        }
+    }
+
     pub fn destination_for<'a>(&'a self, spec: &BuildSpec) -> Result<(&'a str, &'a Destination)> {
         match &spec.destination {
             Some(name) => self
@@ -246,8 +307,58 @@ impl BuildFile {
 }
 
 impl BuildSpec {
-    pub fn image_name(&self) -> &str {
-        self.image.as_deref().unwrap_or(&self.repository)
+    /// Image name: explicit `image:` > repository name > repoUrl basename.
+    pub fn image_name(&self) -> String {
+        if let Some(i) = &self.image {
+            return i.clone();
+        }
+        if !self.repository.is_empty() {
+            return self.repository.clone();
+        }
+        self.repo_url
+            .as_deref()
+            .and_then(|u| crate::config::parse_git_url(u))
+            .map(|(_, _, _, r)| r)
+            .unwrap_or_default()
+    }
+
+    /// Friendly name for menus and reports.
+    pub fn display_name(&self) -> String {
+        self.name.clone().unwrap_or_else(|| self.image_name())
+    }
+
+    /// Resolve the source repository (repoUrl wins; else the azdo triple,
+    /// org defaulting to the devops repo's own org).
+    pub fn source_repo(&self, cfg: &Config) -> Result<crate::config::Repo> {
+        let (provider, organization, project, repository) = match &self.repo_url {
+            Some(u) => crate::config::parse_git_url(u)
+                .with_context(|| format!("build '{}': bad repoUrl '{u}'", self.display_name()))?,
+            None => {
+                anyhow::ensure!(
+                    !self.repository.is_empty() && !self.project.is_empty(),
+                    "build '{}' needs repoUrl or project+repository",
+                    self.display_name()
+                );
+                (
+                    "azdo".to_string(),
+                    self.organization
+                        .clone()
+                        .unwrap_or_else(|| cfg.repo.organization.clone()),
+                    self.project.clone(),
+                    self.repository.clone(),
+                )
+            }
+        };
+        Ok(crate::config::Repo {
+            url: None,
+            provider,
+            organization,
+            project,
+            repository,
+            branch: self.branch.clone(),
+            pat_env: cfg.repo.pat_env.clone(),
+            local_path: None,
+        })
     }
 }
 
@@ -281,14 +392,26 @@ pub fn registry_login(name: &str, dest: &Destination) -> Result<()> {
     Ok(())
 }
 
-/// Load the stack's build definition: build.yml first, legacy build.sh next.
-pub fn load(fs: &MemFs, env: &str, stack: &str) -> Result<Option<BuildFile>> {
-    if let Some(raw) = fs.get(&format!("{env}/{stack}/build.yml")) {
+/// Load the stack's build definition, in order:
+///   1. <dir>/build.yml                (stack-level list)
+///   2. <env>/build.yml                (one catalog shared by the env's stacks)
+///   3. <dir>/build.sh                 (legacy repoList)
+/// `dir` is the stack folder ("zauat/admin" or a root stack like "system").
+pub fn load(fs: &MemFs, dir: &str) -> Result<Option<BuildFile>> {
+    if let Some(raw) = fs.get(&format!("{dir}/build.yml")) {
         let bf: BuildFile = serde_yaml::from_slice(raw)
-            .with_context(|| format!("{env}/{stack}/build.yml is invalid"))?;
+            .with_context(|| format!("{dir}/build.yml is invalid"))?;
         return Ok(Some(bf));
     }
-    if let Some(raw) = fs.get(&format!("{env}/{stack}/build.sh")) {
+    if let Some((env, _)) = dir.rsplit_once('/') {
+        if let Some(raw) = fs.get(&format!("{env}/build.yml")) {
+            let mut bf: BuildFile = serde_yaml::from_slice(raw)
+                .with_context(|| format!("{env}/build.yml is invalid"))?;
+            bf.catalog = true;
+            return Ok(Some(bf));
+        }
+    }
+    if let Some(raw) = fs.get(&format!("{dir}/build.sh")) {
         let text = String::from_utf8_lossy(raw);
         let builds = parse_legacy_repo_list(&text);
         if !builds.is_empty() {
@@ -310,7 +433,11 @@ pub fn load(fs: &MemFs, env: &str, stack: &str) -> Result<Option<BuildFile>> {
                         pat_env: None,
                     },
                 )]),
+                default_platform: default_platform(),
+                mail_groups: BTreeMap::new(),
+                repo_list: Vec::new(),
                 builds,
+                catalog: false,
             }));
         }
     }
@@ -329,10 +456,18 @@ pub fn parse_legacy_repo_list(script: &str) -> Vec<BuildSpec> {
         if !in_list {
             continue;
         }
+        // a commented-out entry is a DISABLED build — never import it
+        if t.starts_with('#') {
+            continue;
+        }
         for quoted in t.split('"').skip(1).step_by(2) {
             let f: Vec<&str> = quoted.split(',').map(str::trim).collect();
             if f.len() == 6 {
                 out.push(BuildSpec {
+                    name: None,
+                    repo_url: None,
+                    repo_clone_url: None,
+                    mail_group: None,
                     organization: Some(f[0].to_string()),
                     project: f[1].to_string(),
                     repository: f[2].to_string(),
@@ -347,6 +482,8 @@ pub fn parse_legacy_repo_list(script: &str) -> Vec<BuildSpec> {
                     dockerfile: default_dockerfile(),
                     args: Default::default(),
                     push: default_push(),
+                    enabled: default_enabled(),
+                    platform: None,
                     local_path: None,
                 });
             }
@@ -367,12 +504,12 @@ pub fn image_base(image_ref: &str) -> Option<String> {
 /// Match a compose service's `image:` to a build entry by image basename.
 pub fn find_for_service_image<'a>(bf: &'a BuildFile, service_image: &str) -> Option<&'a BuildSpec> {
     let base = image_base(service_image)?;
-    bf.builds.iter().find(|b| b.image_name() == base)
+    bf.entries().iter().find(|b| b.image_name() == base)
 }
 
 /// Find a build entry by its image basename.
 pub fn find_by_image<'a>(bf: &'a BuildFile, base: &str) -> Option<&'a BuildSpec> {
-    bf.builds.iter().find(|b| b.image_name() == base)
+    bf.entries().iter().find(|b| b.image_name() == base)
 }
 
 /// Run one build, streaming docker output to the terminal and returning
@@ -380,10 +517,18 @@ pub fn find_by_image<'a>(bf: &'a BuildFile, base: &str) -> Option<&'a BuildSpec>
 pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<BuildReport> {
     let started = Instant::now();
     let (_, dest) = bf.destination_for(spec)?;
-    let full_image = dest.image_ref(spec.image_name(), &spec.tag);
-    let source = format!("{}/{} @ {}", spec.project, spec.repository, spec.branch);
-    eprintln!("\n🔥 forging {full_image}");
+    let full_image = dest.image_ref(&spec.image_name(), &spec.tag);
+    let platform = spec.platform.as_deref().unwrap_or(&bf.default_platform);
+    let src_repo = spec.source_repo(cfg)?;
+    let source = format!(
+        "{}:{}/{} @ {}",
+        src_repo.provider, src_repo.organization, src_repo.repository, src_repo.branch
+    );
+    eprintln!("\n🔥 forging {} — {full_image} [{platform}]", spec.display_name());
     eprintln!("   source: {source}");
+    if spec.repo_clone_url.is_some() {
+        eprintln!("   (repoCloneUrl is set — full clone mode is planned; using zip snapshot for now)");
+    }
     let report = |ok: bool, log: String, started: Instant| BuildReport {
         image: full_image.clone(),
         source: source.clone(),
@@ -392,23 +537,10 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<Build
         log,
     };
 
-    // 1. build context into RAM
+    // 1. build context into RAM (azdo or github, resolved by source_repo)
     let ctx_fs = match &spec.local_path {
         Some(dir) => MemFs::from_dir(dir)?,
-        None => {
-            let repo = crate::config::Repo {
-                organization: spec
-                    .organization
-                    .clone()
-                    .unwrap_or_else(|| cfg.repo.organization.clone()),
-                project: spec.project.clone(),
-                repository: spec.repository.clone(),
-                branch: spec.branch.clone(),
-                pat_env: cfg.repo.pat_env.clone(),
-                local_path: None,
-            };
-            MemFs::from_zip(&remote::download_repo_zip(&repo)?)?
-        }
+        None => MemFs::from_zip(&remote::download_repo_zip(&src_repo)?)?,
     };
     // Pick the dockerfile. The plain `Dockerfile` in these repos often
     // expects artifacts compiled OUTSIDE docker (legacy flow ran gradle
@@ -424,7 +556,7 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<Build
         bail!(
             "'{}' not found in {} (files: {})",
             dockerfile,
-            spec.repository,
+            src_repo.repository,
             ctx_fs.files.len()
         );
     }
@@ -439,12 +571,12 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<Build
 
     // 3. docker build - (output streamed live AND captured for the report)
     let mut cmd = Command::new("docker");
-    cmd.args(["build", "--pull", "-t", &full_image, "-f", &dockerfile]);
+    cmd.args(["build", "--pull", "--platform", platform, "-t", &full_image, "-f", &dockerfile]);
     for (k, v) in &spec.args {
         cmd.args(["--build-arg", &format!("{k}={v}")]);
     }
     cmd.arg("-");
-    let (ok, mut log) = run_tee(cmd, Some(tar_bytes))?;
+    let (ok, mut log) = run_tee_cmd(cmd, Some(tar_bytes))?;
     if !ok {
         eprintln!("❌ build FAILED for {full_image}");
         return Ok(report(false, log, started));
@@ -456,7 +588,7 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<Build
         eprintln!("📤 pushing {full_image}");
         let mut cmd = Command::new("docker");
         cmd.args(["push", &full_image]);
-        let (push_ok, push_log) = run_tee(cmd, None)?;
+        let (push_ok, push_log) = run_tee_cmd(cmd, None)?;
         log.push_str("\n--- push ---\n");
         log.push_str(&push_log);
         if !push_ok {
@@ -489,6 +621,7 @@ mod tests {
     const LEGACY: &str = r#"#!/usr/bin/env bash
 repoList=(
    "BatDigitalI,ConectaRep,grails4-bat-admin-portal,grails-bat-admin-portal,release/uat20250503,za.uat.latest"
+#  "BatDigitalI,ConectaRep,disabled-repo,disabled-image,master,za.uat.latest"
    "BatDigitalI,Core,mn-bat-admin-api,,master,za.uat.latest"
 )
 source "../../shared/build_dockerhub_creds.sh"
@@ -499,14 +632,19 @@ buildStackAzure "zauat" "repoList[@]"
     fn legacy_buildfile() -> BuildFile {
         BuildFile {
             destinations: default_destinations(),
+            default_platform: default_platform(),
+            mail_groups: BTreeMap::new(),
+            repo_list: Vec::new(),
             builds: parse_legacy_repo_list(LEGACY),
+            catalog: false,
         }
     }
 
     #[test]
     fn parses_legacy_build_sh() {
         let builds = parse_legacy_repo_list(LEGACY);
-        assert_eq!(builds.len(), 2);
+        assert_eq!(builds.len(), 2, "commented-out entries must be skipped");
+        assert!(builds.iter().all(|b| b.image_name() != "disabled-image"));
         assert_eq!(builds[0].image_name(), "grails-bat-admin-portal");
         assert_eq!(builds[0].branch, "release/uat20250503");
         assert_eq!(builds[1].image_name(), "mn-bat-admin-api");
