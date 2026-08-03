@@ -358,15 +358,20 @@ pub fn parse_legacy_repo_list(script: &str) -> Vec<BuildSpec> {
     out
 }
 
-/// Match a compose service's `image:` (e.g. "camponuevo/mn-bat-admin-api:za.uat.latest")
-/// to a build entry by image basename.
+/// Basename of a compose `image:` ref — "camponuevo/mn-bat-admin-api:za.uat.latest"
+/// => "mn-bat-admin-api". This is the key that groups services onto one build.
+pub fn image_base(image_ref: &str) -> Option<String> {
+    Some(image_ref.rsplit('/').next()?.split(':').next()?.to_string())
+}
+
+/// Match a compose service's `image:` to a build entry by image basename.
 pub fn find_for_service_image<'a>(bf: &'a BuildFile, service_image: &str) -> Option<&'a BuildSpec> {
-    let base = service_image
-        .rsplit('/')
-        .next()?
-        .split(':')
-        .next()?
-        .to_string();
+    let base = image_base(service_image)?;
+    bf.builds.iter().find(|b| b.image_name() == base)
+}
+
+/// Find a build entry by its image basename.
+pub fn find_by_image<'a>(bf: &'a BuildFile, base: &str) -> Option<&'a BuildSpec> {
     bf.builds.iter().find(|b| b.image_name() == base)
 }
 

@@ -8,11 +8,18 @@ use crate::ui::{self, Pick};
 use crate::vault::MemFs;
 use anyhow::Result;
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Build,
+    Deploy,
+}
+
 pub struct Session<'a> {
     pub fs: &'a MemFs,
     pub cfg: &'a Config,
     pub deploy_allowed: bool,
     pub host: String,
+    pub mode: Mode,
 }
 
 pub fn run(session: &Session) -> Result<()> {
@@ -48,12 +55,21 @@ fn pick_stack(session: &Session, env: &str) -> Result<()> {
     loop {
         match ui::select(&format!("Stack in {env}"), &stacks)? {
             Pick::Back => return Ok(()),
-            Pick::Item(i) => pick_service(session, env, &stacks[i])?,
+            Pick::Item(i) => pick_image(session, env, &stacks[i])?,
         }
     }
 }
 
-fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
+/// One build unit: an image and the compose services that run it.
+struct ImageGroup {
+    base: String,
+    buildable: bool,
+    services: Vec<String>,
+}
+
+/// Level 3: images of the stack (the build units). Several services can
+/// share one image — building happens once per image.
+fn pick_image(session: &Session, env: &str, stack: &str) -> Result<()> {
     let compose_path = format!("{env}/{stack}/docker-compose.yml");
     let Some(raw) = session.fs.get(&compose_path) else {
         eprintln!("  (no docker-compose.yml in {env}/{stack} — was the repo decrypted?)");
@@ -66,7 +82,6 @@ fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
             return Ok(());
         }
     };
-    // service name -> image (needed to map a service onto a build entry)
     let services: Vec<(String, String)> = doc
         .get("services")
         .and_then(|s| s.as_mapping())
@@ -85,73 +100,157 @@ fn pick_service(session: &Session, env: &str, stack: &str) -> Result<()> {
         })
         .unwrap_or_default();
 
-    let mut options: Vec<String> = vec![format!("🏗  whole stack ({} services)", services.len())];
-    options.extend(services.iter().map(|(s, _)| s.clone()));
+    let bf = crate::build::load(session.fs, env, stack)?;
 
-    loop {
-        match ui::select(&format!("{env}/{stack} — target"), &options)? {
-            Pick::Back => return Ok(()),
-            Pick::Item(0) => pick_action(session, env, stack, None)?,
-            Pick::Item(i) => pick_action(session, env, stack, services.get(i - 1))?,
+    // group services by image basename, in compose order
+    let mut groups: Vec<ImageGroup> = Vec::new();
+    for (name, image) in &services {
+        let base = crate::build::image_base(image).unwrap_or_else(|| image.clone());
+        match groups.iter_mut().find(|g| g.base == base) {
+            Some(g) => g.services.push(name.clone()),
+            None => groups.push(ImageGroup {
+                buildable: bf
+                    .as_ref()
+                    .is_some_and(|bf| crate::build::find_by_image(bf, &base).is_some()),
+                base,
+                services: vec![name.clone()],
+            }),
         }
+    }
+    // build entries with no service in the compose (still buildable)
+    if let Some(bf) = &bf {
+        for spec in &bf.builds {
+            if !groups.iter().any(|g| g.base == spec.image_name()) {
+                groups.push(ImageGroup {
+                    base: spec.image_name().to_string(),
+                    buildable: true,
+                    services: Vec::new(),
+                });
+            }
+        }
+    }
+
+    match session.mode {
+        Mode::Build => pick_image_build(session, env, stack, &groups, services.len()),
+        Mode::Deploy => pick_image_deploy(session, env, stack, &groups, services.len()),
     }
 }
 
-fn pick_action(
+/// BUILD MODE — images are the targets; selecting one builds it directly.
+fn pick_image_build(
     session: &Session,
     env: &str,
     stack: &str,
-    service: Option<&(String, String)>,
+    groups: &[ImageGroup],
+    n_services: usize,
 ) -> Result<()> {
-    let label = service.map(|(s, _)| s.as_str()).unwrap_or("whole stack");
-    let deploy_label = if session.deploy_allowed {
-        "🚀 Deploy".to_string()
-    } else {
+    let buildable: Vec<&ImageGroup> = groups.iter().filter(|g| g.buildable).collect();
+    if buildable.is_empty() {
+        eprintln!("  ({env}/{stack} has nothing to build — stock images only)");
+        return Ok(());
+    }
+    let mut options: Vec<String> = vec![format!(
+        "🏗  build whole stack ({} images, {n_services} services)",
+        buildable.len()
+    )];
+    options.extend(buildable.iter().map(|g| {
         format!(
-            "🚀 Deploy (disabled: host '{}' is not the target of this repo)",
-            session.host
+            "📦 {} ({} service{})",
+            g.base,
+            g.services.len(),
+            if g.services.len() == 1 { "" } else { "s" }
         )
-    };
-    let actions = vec!["🔨 Build".to_string(), deploy_label];
+    }));
     loop {
-        match ui::select(&format!("Action for {env}/{stack} [{label}]"), &actions)? {
+        match ui::select(&format!("{env}/{stack} — build image"), &options)? {
             Pick::Back => return Ok(()),
             Pick::Item(0) => {
-                run_builds(session, env, stack, service)?;
-                return Ok(()); // back to target menu after a build run
+                run_builds(session, env, stack, None)?;
             }
-            Pick::Item(_) => {
-                if session.deploy_allowed {
-                    eprintln!(
-                        "  deploy for {env}/{stack} [{label}] — coming in milestone 4 (stdin compose deploy)"
-                    );
-                } else {
-                    eprintln!("  deploy refused: this binary only deploys on the repo's own host");
-                }
-                return Ok(());
+            Pick::Item(i) => {
+                run_builds(session, env, stack, Some(&buildable[i - 1].base))?;
             }
         }
     }
 }
 
-pub fn run_builds(
+/// DEPLOY MODE — services are the targets, grouped by their image.
+fn pick_image_deploy(
     session: &Session,
     env: &str,
     stack: &str,
-    service: Option<&(String, String)>,
+    groups: &[ImageGroup],
+    n_services: usize,
 ) -> Result<()> {
+    let mut options: Vec<String> = vec![format!("🚀 deploy whole stack ({n_services} services)")];
+    options.extend(groups.iter().map(|g| {
+        let tag = if g.buildable { "📦" } else { "🧊" }; // 🧊 = stock image
+        format!(
+            "{tag} {} ({} service{})",
+            g.base,
+            g.services.len(),
+            if g.services.len() == 1 { "" } else { "s" }
+        )
+    }));
+    loop {
+        match ui::select(&format!("{env}/{stack} — deploy"), &options)? {
+            Pick::Back => return Ok(()),
+            Pick::Item(0) => deploy_stub(session, env, stack, "whole stack"),
+            Pick::Item(i) => {
+                let group = &groups[i - 1];
+                pick_deploy_service(session, env, stack, group)?;
+            }
+        }
+    }
+}
+
+/// DEPLOY MODE, level 4: services running one image.
+fn pick_deploy_service(session: &Session, env: &str, stack: &str, group: &ImageGroup) -> Result<()> {
+    let mut options: Vec<String> = vec![format!(
+        "🚀 all {} service{} of {}",
+        group.services.len(),
+        if group.services.len() == 1 { "" } else { "s" },
+        group.base
+    )];
+    options.extend(group.services.iter().map(|s| format!("   {s}")));
+    loop {
+        match ui::select(&format!("{env}/{stack} / {}", group.base), &options)? {
+            Pick::Back => return Ok(()),
+            Pick::Item(0) => {
+                deploy_stub(session, env, stack, &format!("all services of {}", group.base));
+            }
+            Pick::Item(i) => deploy_stub(session, env, stack, &group.services[i - 1]),
+        }
+    }
+}
+
+fn deploy_stub(session: &Session, env: &str, stack: &str, what: &str) {
+    if session.deploy_allowed {
+        eprintln!("  deploy {what} in {env}/{stack} — coming in milestone 4 (stdin compose deploy)");
+    } else {
+        eprintln!(
+            "  deploy refused: host '{}' is not this repo's target (devops-<host>)",
+            session.host
+        );
+    }
+}
+
+/// Build targets are IMAGES: `image = None` builds every entry of the
+/// stack's build list, `Some(base)` builds exactly that image once — no
+/// matter how many services run it.
+pub fn run_builds(session: &Session, env: &str, stack: &str, image: Option<&str>) -> Result<()> {
     let Some(bf) = crate::build::load(session.fs, env, stack)? else {
         eprintln!("  no build.yml and no parseable legacy build.sh in {env}/{stack} — nothing to build");
         return Ok(());
     };
-    let targets: Vec<&crate::build::BuildSpec> = match service {
+    let targets: Vec<&crate::build::BuildSpec> = match image {
         None => bf.builds.iter().collect(),
-        Some((name, image)) => match crate::build::find_for_service_image(&bf, image) {
+        Some(base) => match crate::build::find_by_image(&bf, base) {
             Some(spec) => vec![spec],
             None => {
                 eprintln!(
-                    "  service '{name}' (image '{image}') has no matching build entry — \
-                     it uses a stock image or is built by another stack"
+                    "  image '{base}' has no build entry in {env}/{stack} — \
+                     it's a stock image or built by another stack"
                 );
                 return Ok(());
             }

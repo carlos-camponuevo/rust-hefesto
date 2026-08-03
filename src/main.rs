@@ -24,29 +24,59 @@ const USAGE: &str = "usage:
   hefesto -git <url>                    derive config from an Azure DevOps git URL
                                         (https://dev.azure.com/org/project/_git/repo
                                          or git@ssh.dev.azure.com:v3/org/project/repo)
-  ... --build <env>/<stack>[/<service>] non-interactive: build a stack (or one
-                                        service of it) and exit";
+  hefesto -build [env/stack[/image|service]]   launch in BUILD mode; with a
+                                               target: build it and exit
+  hefesto -deploy [env/stack[/service]]        launch in DEPLOY mode (actions
+                                               land in milestone 4)
+
+  Without -build/-deploy the mode is automatic: DEPLOY on the repo's own
+  host (devops-<hostname>), BUILD everywhere else.";
+
+/// A flag argument is a mode target when it looks like env/stack[/x]
+/// (has a '/', isn't another flag, isn't a config file or URL).
+fn is_target(s: &str) -> bool {
+    s.contains('/') && !s.starts_with('-') && !s.ends_with(".json") && !s.starts_with("http")
+}
 
 fn run() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-
-    // extract optional `--build <target>`
+    let mut mode_override: Option<nav::Mode> = None;
     let mut build_target: Option<String> = None;
-    if let Some(i) = args.iter().position(|a| a == "--build") {
-        anyhow::ensure!(i + 1 < args.len(), "--build needs <env>/<stack>[/<service>]\n{USAGE}");
-        build_target = Some(args.remove(i + 1));
-        args.remove(i);
+    let mut deploy_target: Option<String> = None;
+    let mut git_url: Option<String> = None;
+    let mut cfg_path: Option<String> = None;
+
+    let mut it = std::env::args().skip(1).peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-git" | "--git" => {
+                git_url =
+                    Some(it.next().ok_or_else(|| anyhow::anyhow!("-git needs a URL\n{USAGE}"))?);
+            }
+            "-build" | "--build" => {
+                mode_override = Some(nav::Mode::Build);
+                if it.peek().is_some_and(|n| is_target(n)) {
+                    build_target = it.next();
+                }
+            }
+            "-deploy" | "--deploy" => {
+                mode_override = Some(nav::Mode::Deploy);
+                if it.peek().is_some_and(|n| is_target(n)) {
+                    deploy_target = it.next();
+                }
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            other if !other.starts_with('-') => cfg_path = Some(other.to_string()),
+            other => anyhow::bail!("unknown argument '{other}'\n{USAGE}"),
+        }
     }
 
-    let mut cfg = match args.as_slice() {
-        [] => Config::load("hefesto.json")?,
-        [flag, url] if flag == "-git" || flag == "--git" => Config::from_git_url(url)?,
-        [flag] if flag == "-h" || flag == "--help" => {
-            println!("{USAGE}");
-            return Ok(());
-        }
-        [path] if !path.starts_with('-') => Config::load(path)?,
-        _ => anyhow::bail!("invalid arguments\n{USAGE}"),
+    let mut cfg = match (&git_url, &cfg_path) {
+        (Some(url), _) => Config::from_git_url(url)?,
+        (None, Some(p)) => Config::load(p)?,
+        (None, None) => Config::load("hefesto.json")?,
     };
 
     if cfg.mail.is_none() {
@@ -57,11 +87,21 @@ fn run() -> Result<()> {
     let expected = cfg.expected_hostname();
     let deploy_allowed = expected.as_deref() == Some(host.as_str());
 
+    let mode = mode_override.unwrap_or(if deploy_allowed {
+        nav::Mode::Deploy
+    } else {
+        nav::Mode::Build
+    });
+
     eprintln!("🔥 hefesto — {}", cfg.repo.repository);
+    let mode_txt = match mode {
+        nav::Mode::Build => "BUILD",
+        nav::Mode::Deploy => "DEPLOY",
+    };
     match &expected {
-        Some(_) if deploy_allowed => eprintln!("   host {host} ✓ deploy enabled"),
-        Some(exp) => eprintln!("   host {host} ≠ {exp} → build-only mode"),
-        None => eprintln!("   repo name has no devops-<host> pattern → build-only mode"),
+        Some(_) if deploy_allowed => eprintln!("   host {host} ✓ (repo target) — mode: {mode_txt}"),
+        Some(exp) => eprintln!("   host {host} ≠ {exp} — mode: {mode_txt}"),
+        None => eprintln!("   repo name has no devops-<host> pattern — mode: {mode_txt}"),
     }
 
     // 1. repo into memory
@@ -107,6 +147,7 @@ fn run() -> Result<()> {
         cfg: &cfg,
         deploy_allowed,
         host,
+        mode,
     };
 
     // 3a. non-interactive build
@@ -117,28 +158,33 @@ fn run() -> Result<()> {
             [e, s, svc] => (*e, *s, Some(*svc)),
             _ => anyhow::bail!("--build target must be <env>/<stack>[/<service>]"),
         };
-        let service_pair = match svc_name {
+        // the third segment may be an image basename OR a service name —
+        // a service resolves to the image it runs
+        let image_base = match svc_name {
             None => None,
             Some(name) => {
-                let compose = fs
+                let from_service = fs
                     .get(&format!("{env}/{stack}/docker-compose.yml"))
-                    .ok_or_else(|| anyhow::anyhow!("no docker-compose.yml in {env}/{stack}"))?;
-                let doc: serde_yaml::Value = serde_yaml::from_slice(compose)?;
-                let image = doc
-                    .get("services")
-                    .and_then(|s| s.get(name))
-                    .and_then(|s| s.get("image"))
-                    .and_then(|i| i.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("service '{name}' not found in {env}/{stack} compose")
-                    })?
-                    .to_string();
-                Some((name.to_string(), image))
+                    .and_then(|raw| serde_yaml::from_slice::<serde_yaml::Value>(raw).ok())
+                    .and_then(|doc| {
+                        doc.get("services")?
+                            .get(name)?
+                            .get("image")?
+                            .as_str()
+                            .and_then(build::image_base)
+                    });
+                Some(from_service.unwrap_or_else(|| name.to_string()))
             }
         };
-        return nav::run_builds(&session, env, stack, service_pair.as_ref());
+        return nav::run_builds(&session, env, stack, image_base.as_deref());
     }
 
-    // 3b. interactive navigation
+    // 3b. non-interactive deploy (milestone 4)
+    if let Some(target) = deploy_target {
+        eprintln!("🚀 deploy '{target}' — coming in milestone 4 (stdin compose deploy)");
+        return Ok(());
+    }
+
+    // 3c. interactive navigation
     nav::run(&session)
 }
