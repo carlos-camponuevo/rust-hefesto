@@ -108,6 +108,96 @@ enum MailBody {
     Multi(MultiPart),
 }
 
+/// Mail must never hold up a build or deploy that already finished.
+const SMTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// First proxy setting found in the environment, if any.
+fn proxy_from_env() -> Option<String> {
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+}
+
+/// SMTP through an HTTP proxy.
+///
+/// An HTTP proxy can only carry SMTP inside a CONNECT tunnel, which
+/// `lettre` cannot open — so on proxied hosts the message is handed to
+/// `curl`, which speaks CONNECT + STARTTLS + AUTH natively. The message
+/// goes to a 0600 file in RAM (/dev/shm) and the credentials arrive on
+/// curl's stdin as a config file, so the password never appears in the
+/// process list.
+fn send_via_curl(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    from: &str,
+    to: &[String],
+    raw: &[u8],
+    proxy: &str,
+) -> Result<()> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let dir = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let msg_path = dir.join(format!("hefesto-mail-{}.eml", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&msg_path)
+            .with_context(|| format!("writing the message to {}", msg_path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        f.write_all(raw)?;
+    }
+
+    let mut cfg = vec![
+        format!("url = \"smtp://{host}:{port}\""),
+        "ssl-reqd".to_string(),
+        format!("mail-from = \"{from}\""),
+        format!("upload-file = \"{}\"", msg_path.display()),
+        format!("proxy = \"{proxy}\""),
+        format!("max-time = {}", SMTP_TIMEOUT.as_secs() * 2),
+        "silent".to_string(),
+        "show-error".to_string(),
+    ];
+    for t in to {
+        cfg.push(format!("mail-rcpt = \"{t}\""));
+    }
+    if !user.is_empty() {
+        cfg.push(format!("user = \"{user}:{pass}\""));
+    }
+
+    let mut child = Command::new("curl")
+        .args(["--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("mail needs `curl` on proxied hosts — it is not installed")?;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(cfg.join("\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    let _ = std::fs::remove_file(&msg_path);
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "curl could not deliver through the proxy {proxy} to {host}:{port}: {}",
+            err.trim()
+        );
+    }
+    Ok(())
+}
+
 fn send(cfg: &MailCfg, subject: &str, body: MailBody) -> Result<()> {
     let host = std::env::var(&cfg.smtp_host_env).unwrap_or_default();
     if host.is_empty() {
@@ -130,17 +220,50 @@ fn send(cfg: &MailCfg, subject: &str, body: MailBody) -> Result<()> {
         MailBody::Multi(m) => builder.multipart(m)?,
     };
 
+    // Behind an HTTP proxy, SMTP only travels inside a CONNECT tunnel —
+    // hand the job to curl, which does that natively.
+    if let Some(proxy) = proxy_from_env() {
+        let port: u16 = std::env::var("SMTP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(587);
+        eprintln!("   via proxy {proxy} → {host}:{port}");
+        let started = std::time::Instant::now();
+        send_via_curl(&host, port, &user, &pass, &cfg.from, &cfg.to, &email.formatted(), &proxy)?;
+        eprintln!(
+            "📧 report mailed to {} ({}s, through the proxy)",
+            cfg.to.join(", "),
+            started.elapsed().as_secs()
+        );
+        return Ok(());
+    }
+
     let mailer = if !user.is_empty() && !pass.is_empty() {
         SmtpTransport::starttls_relay(&host)?
             .credentials(Credentials::new(user, pass))
+            // Without a timeout a blocked port (no route, firewall dropping
+            // packets) leaves hefesto waiting on the TCP handshake for
+            // minutes and the run looks frozen after the work succeeded.
+            .timeout(Some(SMTP_TIMEOUT))
             .build()
     } else {
         // unauthenticated internal relay
-        SmtpTransport::builder_dangerous(&host).port(25).build()
+        SmtpTransport::builder_dangerous(&host)
+            .port(25)
+            .timeout(Some(SMTP_TIMEOUT))
+            .build()
     };
-    mailer
-        .send(&email)
-        .with_context(|| format!("sending mail via {host}"))?;
-    eprintln!("📧 report mailed to {}", cfg.to.join(", "));
+    let started = std::time::Instant::now();
+    mailer.send(&email).with_context(|| {
+        format!(
+            "sending mail via {host} (gave up after {}s — is the SMTP port reachable from this host?)",
+            started.elapsed().as_secs()
+        )
+    })?;
+    eprintln!(
+        "📧 report mailed to {} ({}s)",
+        cfg.to.join(", "),
+        started.elapsed().as_secs()
+    );
     Ok(())
 }
