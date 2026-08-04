@@ -1,4 +1,5 @@
 mod build;
+mod report;
 mod config;
 mod deploy;
 mod mail;

@@ -229,6 +229,28 @@ pub fn run_deploy(fs: &MemFs, dir: &str, target: Target) -> Result<DeployReport>
     })
 }
 
+/// HTML e-mail body for a deploy: facts first, terminal output last.
+pub fn report_html(r: &DeployReport, services: usize) -> String {
+    use crate::report::*;
+    let dir = r.stack_name.replacen('-', "/", 1);
+    let mut body = facts(&[
+        ("Environment", esc(&env_label(&dir))),
+        ("Stack", format!("<b>{}</b>", esc(&r.stack_name))),
+        ("Target", esc(&r.what)),
+        ("Services", if services > 0 { services.to_string() } else { String::new() }),
+        ("Duration", format!("{}m {}s", r.duration_secs / 60, r.duration_secs % 60)),
+        ("Image resolution", "always re-resolved against the registry".into()),
+    ]);
+    body.push_str(&log_block("docker stack deploy", &r.log));
+    document(
+        "Deploy report",
+        &r.stack_name,
+        r.ok,
+        if r.ok { "deployed" } else { "failed" },
+        body,
+    )
+}
+
 pub fn report_body(r: &DeployReport) -> String {
     format!(
         "hefesto deploy report — {}\n{} {} [{}]\n    duration: {}s\n\n===== log =====\n{}\n",

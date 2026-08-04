@@ -305,9 +305,10 @@ pub fn run_deploy(session: &Session, dir: &str, target: crate::deploy::Target) -
             if report.ok { "OK ✅" } else { "FAILED ❌" },
             report.what
         );
-        let body = crate::deploy::report_body(&report);
+        let plain = crate::deploy::report_body(&report);
+        let html = crate::deploy::report_html(&report, 0);
         eprintln!("📧 mailing the deploy report to {}", mail_cfg.to.join(", "));
-        if let Err(e) = crate::mail::send_report(mail_cfg, &subject, &body) {
+        if let Err(e) = crate::mail::send_html(mail_cfg, &subject, &html, &plain, &[]) {
             eprintln!("⚠️  could not mail the report: {e:#}");
         }
     } else {
@@ -386,7 +387,11 @@ pub fn run_builds(session: &Session, dir: &str, image: Option<&str>) -> Result<(
                     group,
                     crate::build::BuildReport {
                         image: spec.image_name(),
+                        name: spec.display_name(),
                         source: spec.display_name(),
+                        platform: String::new(),
+                        digest: String::new(),
+                        pushed: false,
                         ok: false,
                         duration_secs: 0,
                         log: format!("{e:#}"),
@@ -418,9 +423,11 @@ fn mail_build_reports(
             reports.len(),
             if ok == reports.len() { "OK ✅" } else { "with FAILURES ❌" }
         );
-        let body = crate::build::report_body_refs(dir, &reports);
+        let plain = crate::build::report_body_refs(dir, &reports);
+        let html = crate::build::report_html_refs(dir, &reports);
         let cfg = crate::config::mailcfg_for(to);
-        if let Err(e) = crate::mail::send_report(&cfg, &subject, &body) {
+        eprintln!("📧 mailing the build report to {}", cfg.to.join(", "));
+        if let Err(e) = crate::mail::send_html(&cfg, &subject, &html, &plain, &[]) {
             eprintln!("⚠️  could not mail the report: {e:#}");
         }
     };
@@ -454,8 +461,10 @@ fn mail_build_reports(
             refs.len(),
             if ok == refs.len() { "OK ✅" } else { "with FAILURES ❌" }
         );
-        let body = crate::build::report_body_refs(dir, &refs);
-        if let Err(e) = crate::mail::send_report(mail_cfg, &subject, &body) {
+        let plain = crate::build::report_body_refs(dir, &refs);
+        let html = crate::build::report_html_refs(dir, &refs);
+        eprintln!("📧 mailing the build report to {}", mail_cfg.to.join(", "));
+        if let Err(e) = crate::mail::send_html(mail_cfg, &subject, &html, &plain, &[]) {
             eprintln!("⚠️  could not mail the report: {e:#}");
         }
     } else {

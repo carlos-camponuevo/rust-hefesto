@@ -29,11 +29,35 @@ use std::time::Instant;
 /// Outcome of one build, for on-screen summary and mailed reports.
 pub struct BuildReport {
     pub image: String,
+    pub name: String,
     pub source: String,
+    pub platform: String,
+    /// digest the registry returned on push (or the local image id)
+    pub digest: String,
+    pub pushed: bool,
     pub ok: bool,
     pub duration_secs: u64,
     /// captured docker output (kept to the last `LOG_KEEP_LINES` lines)
     pub log: String,
+}
+
+/// Pull the image digest out of docker output: `push` prints
+/// "tag: digest: sha256:… size: …", `build` prints "writing image sha256:…".
+fn digest_from_log(log: &str) -> String {
+    for needle in ["digest: sha256:", "writing image sha256:"] {
+        if let Some(i) = log.rfind(needle) {
+            let rest = &log[i + needle.len() - "sha256:".len()..];
+            let hex: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == ':' || *c == 's' || *c == 'h' || *c == 'a' || *c == '2' || *c == '5' || *c == '6')
+                .collect();
+            let hex = hex.trim_end_matches(|c: char| !c.is_ascii_hexdigit()).to_string();
+            if hex.len() > 20 {
+                return hex;
+            }
+        }
+    }
+    String::new()
 }
 
 const LOG_KEEP_LINES: usize = 400;
@@ -140,7 +164,11 @@ fn run_tee_pty(
         cmd.stdin(Stdio::piped());
     }
     let mut child = cmd.spawn().context("failed to run `docker` — is it installed?")?;
-    drop(slave); // our copy must close or the master never sees EOF
+    // BOTH the Command and our own handle keep pty slave fds open. Until
+    // every parent-side copy is closed, reading the master blocks forever
+    // after the child exits — the process looks frozen mid-build.
+    drop(cmd);
+    drop(slave);
     let stdin_handle = stdin_data.map(|data| {
         let mut stdin = child.stdin.take().expect("piped stdin");
         std::thread::spawn(move || {
@@ -235,6 +263,53 @@ pub fn report_body_refs(dir: &str, reports: &[&BuildReport]) -> String {
         b.push_str(&format!("\n===== log: {} =====\n{}\n", r.image, r.log));
     }
     b
+}
+
+/// HTML e-mail body for a set of builds: header facts first, logs last.
+pub fn report_html_refs(dir: &str, reports: &[&BuildReport]) -> String {
+    use crate::report::*;
+    let ok_n = reports.iter().filter(|r| r.ok).count();
+    let all_ok = ok_n == reports.len();
+    let total: u64 = reports.iter().map(|r| r.duration_secs).sum();
+
+    let mut body = String::new();
+    let stack = dir.rsplit('/').next().unwrap_or(dir);
+    body.push_str(&facts(&[
+        ("Environment", esc(&env_label(dir))),
+        ("Stack", format!("<b>{}</b>", esc(stack))),
+        ("Result", format!("<b>{ok_n} of {}</b> image{} built", reports.len(),
+                           if reports.len() == 1 { "" } else { "s" })),
+        ("Duration", format!("{}m {}s", total / 60, total % 60)),
+    ]));
+
+    for r in reports {
+        let mut inner = vec![
+            ("Image", mono(&r.image)),
+            ("Source", esc(&r.source)),
+            ("Platform", esc(&r.platform)),
+        ];
+        if !r.digest.is_empty() {
+            inner.push(("Digest", format!("{}{}", mono(&short_digest(&r.digest)),
+                if r.pushed { " <span style=\"color:#12703a;font:600 11px/1 -apple-system,Arial,sans-serif\">pushed</span>" } else { "" })));
+        }
+        inner.push(("Duration", format!("{}s", r.duration_secs)));
+        body.push_str(&card(
+            &r.name,
+            r.ok,
+            if r.ok { "success" } else { "failed" },
+            facts(&inner.iter().map(|(k, v)| (*k, v.clone())).collect::<Vec<_>>()),
+        ));
+    }
+    for r in reports {
+        body.push_str(&log_block(&format!("log — {}", r.image), &r.log));
+    }
+    document(
+        "Build report",
+        dir,
+        all_ok,
+        if all_ok { "success" } else { "failed" },
+        body,
+    )
 }
 
 fn tail_lines(s: &str, keep: usize) -> String {
@@ -680,9 +755,16 @@ pub fn run_build(cfg: &Config, bf: &BuildFile, spec: &BuildSpec) -> Result<Build
     if spec.repo_clone_url.is_some() {
         eprintln!("   (repoCloneUrl is set — full clone mode is planned; using zip snapshot for now)");
     }
+    let spec_name = spec.display_name();
+    let platform_s = platform.to_string();
+    let pushed_flag = spec.push;
     let report = |ok: bool, log: String, started: Instant| BuildReport {
         image: full_image.clone(),
+        name: spec_name.clone(),
         source: source.clone(),
+        platform: platform_s.clone(),
+        digest: digest_from_log(&log),
+        pushed: pushed_flag && ok,
         ok,
         duration_secs: started.elapsed().as_secs(),
         log,
@@ -850,5 +932,67 @@ buildStackAzure "zauat" "repoList[@]"
         let mut spec = bf.builds[0].clone();
         spec.destination = Some("missing".into());
         assert!(bf.destination_for(&spec).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pty_tests {
+    use super::*;
+
+    /// Regression: the pty reader must see EOF once the child exits.
+    /// Before `drop(cmd)` this test hung forever.
+    #[test]
+    fn pty_run_terminates_and_captures() {
+        let pty = open_pty().expect("openpty");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo hello-from-pty; exit 0"]);
+        let (ok, log) = run_tee_pty(cmd, None, pty).expect("run");
+        assert!(ok, "child should exit 0");
+        assert!(log.contains("hello-from-pty"), "output captured: {log:?}");
+    }
+
+    /// A failing child is reported as such, and stdin data is delivered.
+    #[test]
+    fn pty_reports_failure_and_feeds_stdin() {
+        let pty = open_pty().expect("openpty");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "cat; exit 3"]);
+        let (ok, log) = run_tee_pty(cmd, Some(b"piped-input\n".to_vec(), ), pty).expect("run");
+        assert!(!ok, "exit 3 must be reported as failure");
+        assert!(log.contains("piped-input"), "stdin echoed back: {log:?}");
+    }
+}
+
+#[cfg(test)]
+mod html_preview {
+    use super::*;
+    /// Writes a sample report to /tmp for eyeballing: cargo test -- --ignored preview
+    #[test]
+    #[ignore]
+    fn preview() {
+        let ok = BuildReport {
+            image: "ghcr.io/my-org/admin-portal:br.master.latest".into(),
+            name: "Admin Portal".into(),
+            source: "azdo:ExampleOrg/admin-portal @ master".into(),
+            platform: "linux/amd64".into(),
+            digest: "sha256:3a09bd902010166df8803b6e6718d17f20073dd0b18615cafa332e457c87a7df".into(),
+            pushed: true,
+            ok: true,
+            duration_secs: 67,
+            log: "#8 [build 5/5] RUN ./gradlew assemble\n#8 42.89 BUILD SUCCESSFUL in 42s\n#8 DONE 43.5s\n\n--- push ---\nThe push refers to repository [ghcr.io/my-org/admin-portal]\n6f0165bfabd4: Pushed\nbr.master.latest: digest: sha256:3a09bd902010166df8803b6e6718d17f20073dd0b18615cafa332e457c87a7df size: 1581".into(),
+        };
+        let bad = BuildReport {
+            image: "ghcr.io/my-org/order-tracking:br.master.latest".into(),
+            name: "Order Tracking".into(),
+            source: "azdo:ExampleOrg/order-tracking @ master".into(),
+            platform: "linux/amd64".into(),
+            digest: String::new(),
+            pushed: false,
+            ok: false,
+            duration_secs: 12,
+            log: "#7 [build 4/5] RUN ./gradlew clean\n#7 ERROR: could not resolve dependency com.example:missing:1.0\nERROR: failed to solve: process \"/bin/sh -c ./gradlew clean\" did not complete successfully: exit code: 1".into(),
+        };
+        std::fs::write("/tmp/hefesto-build-report.html", report_html_refs("brprod/admin", &[&ok, &bad])).unwrap();
+        eprintln!("wrote /tmp/hefesto-build-report.html");
     }
 }

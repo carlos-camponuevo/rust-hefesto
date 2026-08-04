@@ -21,6 +21,51 @@ fn mime_for(path: &Path) -> ContentType {
     ContentType::parse(ct).unwrap_or(ContentType::TEXT_PLAIN)
 }
 
+/// Logo shipped as an inline (cid:) attachment — Gmail and Outlook refuse
+/// data: URIs, so the image has to travel as a real MIME part.
+const LOGO_PNG: &[u8] = include_bytes!("../docs/brand/hefesto.logo-small.png");
+
+/// HTML report with a plain-text alternative, the inline logo, and any
+/// files attached. Structure: mixed( related( alternative(text, html),
+/// logo ), attachments… ) — the layout every mail client understands.
+pub fn send_html(
+    cfg: &MailCfg,
+    subject: &str,
+    html: &str,
+    plain: &str,
+    files: &[PathBuf],
+) -> Result<()> {
+    let related = MultiPart::related()
+        .multipart(MultiPart::alternative_plain_html(
+            plain.to_string(),
+            html.to_string(),
+        ))
+        .singlepart(
+            Attachment::new_inline(crate::report::LOGO_CID.to_string())
+                .body(LOGO_PNG.to_vec(), ContentType::parse("image/png")?),
+        );
+
+    let mut parts = MultiPart::mixed().multipart(related);
+    let mut total = 0usize;
+    for f in files {
+        let data = std::fs::read(f).with_context(|| format!("reading attachment '{}'", f.display()))?;
+        total += data.len();
+        let name = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        parts = parts.singlepart(Attachment::new(name).body(data, mime_for(f)));
+    }
+    if total * 4 / 3 > 9_000_000 {
+        eprintln!(
+            "   ⚠️  attachments total {} MiB — may exceed the SMTP size limit",
+            total / 1_048_576
+        );
+    }
+    send(cfg, subject, MailBody::Multi(parts))
+}
+
 /// Same as `send_report`, with files attached.
 pub fn send_report_with_files(
     cfg: &MailCfg,
