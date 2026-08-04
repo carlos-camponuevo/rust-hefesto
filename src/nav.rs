@@ -306,9 +306,15 @@ pub fn run_deploy(session: &Session, dir: &str, target: crate::deploy::Target) -
             report.what
         );
         let body = crate::deploy::report_body(&report);
+        eprintln!("📧 mailing the deploy report to {}", mail_cfg.to.join(", "));
         if let Err(e) = crate::mail::send_report(mail_cfg, &subject, &body) {
             eprintln!("⚠️  could not mail the report: {e:#}");
         }
+    } else {
+        eprintln!(
+            "ℹ️  deploy report not mailed — no mail configured (add a \"mail\" block to the \
+             config or set HEFESTO_MAIL_TO=addr1,addr2)"
+        );
     }
     Ok(())
 }

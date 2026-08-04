@@ -38,10 +38,141 @@ pub struct BuildReport {
 
 const LOG_KEEP_LINES: usize = 400;
 
+/// Strip ANSI escapes and turn carriage-return progress updates into
+/// plain lines, so a captured log is readable in an e-mail.
+fn clean_for_report(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // CSI ... final byte in @-~, or a two-char sequence
+                if chars.peek() == Some(&'[') {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if ('@'..='~').contains(&c2) {
+                            break;
+                        }
+                    }
+                } else {
+                    chars.next();
+                }
+            }
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n'); // in-place update -> its own line
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    // collapse the runs of identical consecutive lines a progress display leaves behind
+    let mut lines: Vec<&str> = Vec::new();
+    for l in out.lines() {
+        if lines.last().map(|p: &&str| p.trim_end() == l.trim_end()) != Some(true) {
+            lines.push(l);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Allocate a pseudo-terminal so the child believes it is talking to a
+/// real terminal. Docker only renders its live, in-place progress display
+/// when stdout is a TTY; through a plain pipe it repeats static lines.
+#[cfg(unix)]
+fn open_pty() -> Option<(std::fs::File, std::fs::File)> {
+    use std::os::fd::FromRawFd;
+    let (mut master, mut slave) = (0i32, 0i32);
+    // SAFETY: openpty writes two valid fds or returns non-zero.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    unsafe {
+        Some((
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        ))
+    }
+}
+
 /// Run a command streaming its output live to the terminal AND capturing
-/// it. `stdin_data` (the tar context) is fed from a thread to avoid
-/// pipe-buffer deadlocks with chatty children.
-pub fn run_tee_cmd(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
+/// it. `stdin_data` (the tar context / compose file) is fed from a thread
+/// to avoid pipe-buffer deadlocks with chatty children.
+pub fn run_tee_cmd(cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
+    #[cfg(unix)]
+    {
+        use std::io::IsTerminal;
+        // Only worth a pty when our own stdout is a terminal; under cron or
+        // a pipe the plain, line-based output is what you want anyway.
+        if std::io::stdout().is_terminal() {
+            if let Some(pty) = open_pty() {
+                return run_tee_pty(cmd, stdin_data, pty);
+            }
+        }
+    }
+    run_tee_piped(cmd, stdin_data)
+}
+
+/// TTY-backed variant: the child writes to a pty, we mirror those bytes
+/// to our own stdout untouched (so progress redraws work) and keep a copy.
+#[cfg(unix)]
+fn run_tee_pty(
+    mut cmd: Command,
+    stdin_data: Option<Vec<u8>>,
+    pty: (std::fs::File, std::fs::File),
+) -> Result<(bool, String)> {
+    use std::io::{Read, Write};
+    let (mut master, slave) = pty;
+    let slave_out = slave.try_clone().context("cloning the pty slave")?;
+    let slave_err = slave.try_clone().context("cloning the pty slave")?;
+    cmd.stdout(Stdio::from(slave_out));
+    cmd.stderr(Stdio::from(slave_err));
+    if stdin_data.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd.spawn().context("failed to run `docker` — is it installed?")?;
+    drop(slave); // our copy must close or the master never sees EOF
+    let stdin_handle = stdin_data.map(|data| {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        })
+    });
+
+    let mut captured: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut out = std::io::stdout();
+    loop {
+        match master.read(&mut buf) {
+            Ok(0) => break,
+            // EIO is how Linux reports "the slave side closed"
+            Err(ref e) if e.raw_os_error() == Some(libc::EIO) => break,
+            Err(_) => break,
+            Ok(n) => {
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+                captured.extend_from_slice(&buf[..n]);
+            }
+        }
+    }
+    if let Some(h) = stdin_handle {
+        let _ = h.join();
+    }
+    let status = child.wait()?;
+    let log = clean_for_report(&String::from_utf8_lossy(&captured));
+    Ok((status.success(), tail_lines(&log, LOG_KEEP_LINES)))
+}
+
+fn run_tee_piped(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(bool, String)> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_data.is_some() {
         cmd.stdin(Stdio::piped());
@@ -80,7 +211,7 @@ pub fn run_tee_cmd(mut cmd: Command, stdin_data: Option<Vec<u8>>) -> Result<(boo
     }
     let mut log = t_out.join().unwrap_or_default();
     log.push_str(&t_err.join().unwrap_or_default());
-    Ok((status.success(), tail_lines(&log, LOG_KEEP_LINES)))
+    Ok((status.success(), tail_lines(&clean_for_report(&log), LOG_KEEP_LINES)))
 }
 
 /// Plain-text report for mails / logs.

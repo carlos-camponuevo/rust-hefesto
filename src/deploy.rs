@@ -6,7 +6,8 @@
 //! into its `environment:` (compose precedence preserved: later files
 //! override earlier ones, explicit environment: entries win over all).
 //! The self-contained compose is then piped to
-//!     docker stack deploy --with-registry-auth --detach=false -c -  <env>-<stack>
+//!     docker stack deploy --resolve-image always --with-registry-auth \
+//!                         --detach=false -c -  <env>-<stack>
 //! so nothing plaintext ever touches disk. Output is streamed live and
 //! captured for the report, exactly like builds.
 
@@ -202,6 +203,11 @@ pub fn run_deploy(fs: &MemFs, dir: &str, target: Target) -> Result<DeployReport>
     cmd.args([
         "stack",
         "deploy",
+        // Re-resolve every tag against the registry. Without this, Swarm
+        // keeps the digest already pinned in the service spec, so a moved
+        // tag (`*.latest`) deploys the OLD image and looks like a no-op.
+        "--resolve-image",
+        "always",
         "--with-registry-auth",
         "--detach=false",
         "--compose-file",

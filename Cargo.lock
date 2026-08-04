@@ -483,6 +483,7 @@ dependencies = [
  "hostname",
  "inquire",
  "lettre",
+ "libc",
  "pbkdf2",
  "reqwest",
  "serde",
