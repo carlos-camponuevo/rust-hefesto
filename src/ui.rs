@@ -31,7 +31,20 @@ impl Drop for RawGuard {
     }
 }
 
+/// Dimmed / bold ANSI, kept inline so the picker has no styling deps.
+const DIM: &str = "\x1b[2m";
+const BOLD: &str = "\x1b[1m";
+const GOLD: &str = "\x1b[33m";
+const RESET: &str = "\x1b[0m";
+
 pub fn select(title: &str, items: &[String]) -> Result<Pick> {
+    select_in(&[], title, items)
+}
+
+/// Same picker, showing where you are: each level of `path` is printed
+/// above the options, indented, so the trail stays visible while you
+/// drill down instead of scrolling away.
+pub fn select_in(path: &[String], title: &str, items: &[String]) -> Result<Pick> {
     let _guard = RawGuard::new()?;
     let mut out = stdout();
     let mut filter = String::new();
@@ -65,17 +78,27 @@ pub fn select(title: &str, items: &[String]) -> Result<Pick> {
         queue!(
             out,
             Print(format!(
-                "? {title}{ftxt}  (↑↓ move · →/enter select · ← back)\r\n"
+                "{BOLD}? {title}{RESET}{DIM}{ftxt}  (↑↓ move · →/enter select · ← back){RESET}\r\n"
             ))
         )?;
         lines += 1;
+        // the trail: one indented line per level already chosen
+        for (depth, step) in path.iter().enumerate() {
+            let indent = "  ".repeat(depth + 1);
+            queue!(out, Print(format!("{indent}{DIM}└ {step}{RESET}\r\n")))?;
+            lines += 1;
+        }
+        let indent = "  ".repeat(path.len() + 1);
         for (i, (_, s)) in visible.iter().enumerate() {
-            let marker = if i == pos { "❯" } else { " " };
-            queue!(out, Print(format!("{marker} {s}\r\n")))?;
+            if i == pos {
+                queue!(out, Print(format!("{indent}{GOLD}❯ {BOLD}{s}{RESET}\r\n")))?;
+            } else {
+                queue!(out, Print(format!("{indent}  {s}\r\n")))?;
+            }
             lines += 1;
         }
         if visible.is_empty() {
-            queue!(out, Print("  (no match — Backspace to edit filter)\r\n"))?;
+            queue!(out, Print(format!("{indent}{DIM}(no match — Backspace to edit filter){RESET}\r\n")))?;
             lines += 1;
         }
         out.flush()?;

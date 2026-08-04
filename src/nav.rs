@@ -24,6 +24,11 @@ pub struct Session<'a> {
     pub mode: Mode,
 }
 
+/// "bruat/pix" -> ["bruat", "pix"] for the picker's breadcrumb trail.
+fn path_of(dir: &str) -> Vec<String> {
+    dir.split('/').map(String::from).collect()
+}
+
 fn has_compose(fs: &MemFs, dir: &str) -> bool {
     fs.get(&format!("{dir}/docker-compose.yml")).is_some()
 }
@@ -70,7 +75,7 @@ pub fn run(session: &Session) -> Result<()> {
         })
         .collect();
     loop {
-        match ui::select("Environment / stack", &labels)? {
+        match ui::select_in(&[], "Environment / stack", &labels)? {
             Pick::Back => return Ok(()), // ← at root exits
             Pick::Item(i) => {
                 let (dir, is_stack) = &options[i];
@@ -98,7 +103,7 @@ fn pick_stack(session: &Session, env: &str) -> Result<()> {
         return Ok(());
     }
     loop {
-        match ui::select(&format!("Stack in {env}"), &stacks)? {
+        match ui::select_in(&[env.to_string()], "Stack", &stacks)? {
             Pick::Back => return Ok(()),
             Pick::Item(i) => pick_image(session, &format!("{env}/{}", stacks[i]))?,
         }
@@ -209,7 +214,7 @@ fn pick_image_build(
         )
     }));
     loop {
-        match ui::select(&format!("{dir} — build image"), &options)? {
+        match ui::select_in(&path_of(dir), "Build image", &options)? {
             Pick::Back => return Ok(()),
             Pick::Item(0) => {
                 run_builds(session, dir, None)?;
@@ -239,7 +244,7 @@ fn pick_image_deploy(
         )
     }));
     loop {
-        match ui::select(&format!("{dir} — deploy"), &options)? {
+        match ui::select_in(&path_of(dir), "Deploy", &options)? {
             Pick::Back => return Ok(()),
             Pick::Item(0) => {
                 run_deploy(session, dir, crate::deploy::Target::WholeStack)?;
@@ -262,7 +267,9 @@ fn pick_deploy_service(session: &Session, dir: &str, group: &ImageGroup) -> Resu
     )];
     options.extend(group.services.iter().map(|s| format!("   {s}")));
     loop {
-        match ui::select(&format!("{dir} / {}", group.base), &options)? {
+        let mut p = path_of(dir);
+        p.push(group.base.clone());
+        match ui::select_in(&p, "Deploy service", &options)? {
             Pick::Back => return Ok(()),
             Pick::Item(0) => {
                 run_deploy(

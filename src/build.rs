@@ -90,14 +90,59 @@ fn clean_for_report(raw: &str) -> String {
             c => out.push(c),
         }
     }
-    // collapse the runs of identical consecutive lines a progress display leaves behind
-    let mut lines: Vec<&str> = Vec::new();
-    for l in out.lines() {
-        if lines.last().map(|p: &&str| p.trim_end() == l.trim_end()) != Some(true) {
-            lines.push(l);
+    collapse_progress(&out)
+}
+
+/// Digits masked out, so "Waiting 5 seconds" and "Waiting 4 seconds"
+/// compare equal — they are the same progress line, not new information.
+fn shape_of(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut in_digits = false;
+    for c in line.chars() {
+        if c.is_ascii_digit() {
+            if !in_digits {
+                out.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            out.push(c);
         }
     }
-    lines.join("\n")
+    out
+}
+
+/// Fold the repeated frames a live progress display leaves in a captured
+/// log: consecutive lines of the same shape collapse to the last one
+/// (so the final state survives), and blank runs collapse to one.
+fn collapse_progress(text: &str) -> String {
+    let mut kept: Vec<String> = Vec::new();
+    let mut last_shape: Option<String> = None;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        if line.is_empty() {
+            let last_blank = kept.last().map(|l| l.is_empty()).unwrap_or(true);
+            if !last_blank {
+                kept.push(String::new());
+            }
+            continue;
+        }
+        let shape = shape_of(line);
+        if last_shape.as_deref() == Some(shape.as_str()) {
+            // same progress line again: drop any blank we buffered and
+            // replace the previous frame with this newer one
+            while kept.last().map(|l| l.is_empty()).unwrap_or(false) {
+                kept.pop();
+            }
+            kept.pop();
+        }
+        kept.push(line.to_string());
+        last_shape = Some(shape);
+    }
+    while kept.last().map(|l| l.is_empty()).unwrap_or(false) {
+        kept.pop();
+    }
+    kept.join("\n")
 }
 
 /// Allocate a pseudo-terminal so the child believes it is talking to a
@@ -932,6 +977,38 @@ buildStackAzure "zauat" "repoList[@]"
         let mut spec = bf.builds[0].clone();
         spec.destination = Some("missing".into());
         assert!(bf.destination_for(&spec).is_err());
+    }
+}
+
+#[cfg(test)]
+mod log_cleanup {
+    use super::*;
+
+    #[test]
+    fn collapses_repeated_progress_frames() {
+        // exactly what `docker stack deploy --detach=false` emits
+        let raw = "Updating service x (id: abc)\n\nverify: Waiting 5 seconds to verify that tasks are stable... \n\nverify: Waiting 5 seconds to verify that tasks are stable... \n\nverify: Waiting 5 seconds to verify that tasks are stable... \n\nverify: Waiting 4 seconds to verify that tasks are stable... \n\nverify: Waiting 4 seconds to verify that tasks are stable... \n\nverify: Waiting 1 seconds to verify that tasks are stable... \n\nverify: Service converged\n";
+        let out = clean_for_report(raw);
+        let waits = out.matches("to verify that tasks are stable").count();
+        assert_eq!(waits, 1, "one frame should survive, got:\n{out}");
+        assert!(out.contains("Waiting 1 seconds"), "the LAST frame is the one kept:\n{out}");
+        assert!(out.contains("Service converged"), "real output must survive:\n{out}");
+        assert!(out.contains("Updating service x"));
+    }
+
+    #[test]
+    fn keeps_distinct_build_lines() {
+        let raw = "#7 0.299 Downloading gradle\n#7 12.34 > Task :clean UP-TO-DATE\n#8 42.89 BUILD SUCCESSFUL in 42s\n";
+        let out = clean_for_report(raw);
+        assert_eq!(out.lines().count(), 3, "distinct lines must all survive:\n{out}");
+    }
+
+    #[test]
+    fn strips_ansi_and_carriage_returns() {
+        let raw = "\u{1b}[1;32mgreen\u{1b}[0m\r\nplain\r";
+        let out = clean_for_report(raw);
+        assert!(!out.contains('\u{1b}'), "escapes removed: {out:?}");
+        assert!(out.contains("green") && out.contains("plain"));
     }
 }
 
