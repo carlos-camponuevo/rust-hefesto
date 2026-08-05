@@ -4,3 +4,4 @@ hefesto*.json
 hefesto*.yml
 hefesto*.yaml
 !hefesto.example.json
+CLAUDE.local.md
